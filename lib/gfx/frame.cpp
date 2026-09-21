@@ -1,4 +1,6 @@
 #include "frame.hpp"
+#include <aurora/gfx.h>
+#include <cstdlib>
 
 #include "depth_peek.hpp"
 #include "pipeline_cache.hpp"
@@ -118,7 +120,7 @@ std::atomic_int64_t g_lastPresentNs = 0;
 std::atomic_int64_t g_presentPeriodNs = 0;
 std::atomic_int64_t g_cpuFrameTimeNs = 0;
 PresentClock::time_point g_cpuFrameStart;
-constexpr auto FrameStartSafetyMargin = std::chrono::milliseconds{2};
+constexpr auto FrameStartSafetyMargin = std::chrono::milliseconds{1};
 constexpr auto MaxPacingSample = std::chrono::milliseconds{250};
 constexpr uint32_t PacingEmaWeight = 8;
 
@@ -614,7 +616,13 @@ std::optional<size_t> acquire_mapped_staging_buffer() {
 
 bool begin_frame() {
   ZoneScoped;
-  // pace_frame_start();
+  // Opt-in until display-specific button-to-photon measurements validate it.
+  // The simulation retains its independent 60 Hz pacing in pc/vi.c.
+  static const bool jit = [] {
+    const char* value = std::getenv("MELEE_NET_JIT");
+    return value && value[0] == '1';
+  }();
+  if (jit && aurora_vsync_enabled()) pace_frame_start();
   const size_t frameSlot = acquire_frame_slot();
   const auto stagingSlot = acquire_mapped_staging_buffer();
   if (!stagingSlot) {
@@ -629,19 +637,20 @@ bool begin_frame() {
   frame.stagingBuffer = *stagingSlot;
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
-  const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size) {
+  const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size, const char* name) {
     if (size <= 0) {
       return;
     }
-    buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
+    buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)),
+                     static_cast<size_t>(size), name};
     bufferOffset += size;
   };
-  mapBuffer(frame.verts, VertexBufferSize);
-  mapBuffer(frame.uniforms, UniformBufferSize);
-  mapBuffer(frame.indices, IndexBufferSize);
-  mapBuffer(frame.storage, StorageBufferSize);
+  mapBuffer(frame.verts, VertexBufferSize, "verts");
+  mapBuffer(frame.uniforms, UniformBufferSize, "uniforms");
+  mapBuffer(frame.indices, IndexBufferSize, "indices");
+  mapBuffer(frame.storage, StorageBufferSize, "storage");
   if constexpr (UseTextureBuffer) {
-    mapBuffer(frame.textureUpload, TextureUploadSize);
+    mapBuffer(frame.textureUpload, TextureUploadSize, "textureUpload");
   }
 
   begin_recording(frame, frameSlot);
@@ -669,6 +678,28 @@ void end_frame(EndFrameCallback callback) {
   const uint64_t frameId = frame.frameId;
   end_pipeline_frame();
   ++g_frameIndex;
+
+  /* MELEE_GFX_STATS=1: peak per-pool high-water marks, so the frame budgets
+   * in resources.hpp can be sized from data instead of guessed at. */
+  {
+    static const bool report = getenv("MELEE_GFX_STATS") != nullptr;
+    if (report) {
+      static size_t peakVerts, peakUniforms, peakIndices, peakStorage, peakTexture;
+      static auto last = PresentClock::now();
+      peakVerts = std::max(peakVerts, frame.verts.size());
+      peakUniforms = std::max(peakUniforms, frame.uniforms.size());
+      peakIndices = std::max(peakIndices, frame.indices.size());
+      peakStorage = std::max(peakStorage, frame.storage.size());
+      peakTexture = std::max(peakTexture, frame.textureUpload.size());
+      const auto now = PresentClock::now();
+      if (now - last >= std::chrono::seconds{1}) {
+        last = now;
+        Log.info("staging peak KiB: verts {} uniforms {} indices {} storage {} texture {}",
+                 peakVerts / 1024, peakUniforms / 1024, peakIndices / 1024, peakStorage / 1024,
+                 peakTexture / 1024);
+      }
+    }
+  }
 
   const size_t stagingSlot = frame.stagingBuffer;
   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {

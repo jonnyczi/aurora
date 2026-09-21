@@ -7,15 +7,16 @@
 extern "C" {
 #endif
 
-typedef void (*ARQCallback)(uintptr_t pointerToARQRequest);
+struct ARQRequest;
+typedef void (*ARQCallback)(struct ARQRequest* request);
 
 struct ARQRequest {
     /* 0x00 */ struct ARQRequest *next;
-    /* 0x04 */ u32 owner;
+    /* 0x04 */ uintptr_t owner;
     /* 0x08 */ u32 type;
     /* 0x0C */ u32 priority;
-    /* 0x10 */ u32 source;
-    /* 0x14 */ u32 dest;
+    /* 0x10 */ uintptr_t source;
+    /* 0x14 */ uintptr_t dest;
     /* 0x18 */ u32 length;
     /* 0x1C */ ARQCallback callback;
 };
@@ -61,13 +62,21 @@ void* ARGetStorageAddress();
 // ARQ
 void ARQInit(void);
 void ARQReset(void);
-void ARQPostRequest(ARQRequest* request, u32 owner, u32 type, u32 priority, uintptr_t source, uintptr_t dest, u32 length, ARQCallback callback);
+void ARQPostRequest(ARQRequest* request, uintptr_t owner, u32 type, u32 priority, uintptr_t source, uintptr_t dest, u32 length, ARQCallback callback);
 void ARQRemoveRequest(ARQRequest* request);
-void ARQRemoveOwnerRequest(u32 owner);
+void ARQRemoveOwnerRequest(uintptr_t owner);
 void ARQFlushQueue(void);
 void ARQSetChunkSize(u32 size);
 u32 ARQGetChunkSize(void);
+
+/* melee-pc: host pointer to the emulated ARAM (valid after ARInit). */
+u8* aurora_aram_base(void);
 BOOL ARQCheckInit(void);
+
+// melee-pc: ARAM transfers posted and not yet retired. The netplay tick
+// drains on this together with aurora_dvd_inflight(), so a load costs both
+// peers the same number of ticks (src/pc/net.c).
+int aurora_arq_inflight(void);
 
 u16 __ARGetInterruptStatus(void);
 void __ARClearInterrupt(void);
