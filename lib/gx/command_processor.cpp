@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <span>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -1291,22 +1292,35 @@ static gfx::PipelineRef xr_batch_pipeline(bool motion, XrMotionKind kind = XrMot
 }
 
 // SpaceWarp motion vectors: each opaque world draw's position matrices are
-// kept by what it draws (its vertex bytes and position array, and how many
-// draws with the same before it this frame), so next frame the same draw
-// finds where its vertices were. Display lists are copied into the FIFO,
-// so the bytes, not their address, are what stays the same. A draw found
-// gets last frame's matrices pushed to the storage buffer; one not found
-// (new, immediate-mode data that changes, or a jump: a respawn, a cut) is
-// taken as fixed in the game world.
+// kept by what it draws (its vertex bytes and position array), so next frame
+// the same draw finds where its vertices were. Display lists are copied into
+// the FIFO, so the bytes, not their address, are what stays the same. Draws
+// of the same thing (Mushroom Kingdom's blocks, one model each) are told
+// apart by where they are: each takes the nearest of last frame's not yet
+// taken, if nearer than half the gap between last frame's copies. By order
+// alone, a block that blinks as it respawns (drawn every other frame)
+// shifted the blocks after it onto their neighbours' last positions, and the
+// blinking block itself took a neighbour's: SpaceWarp warped them by a block
+// width. A draw found gets last frame's matrices pushed to the storage
+// buffer; one not found (new, immediate-mode data that changes, back from
+// hidden, or a jump: a respawn, a cut) is taken as fixed in the game world.
 namespace {
 struct XrPrevMatrices {
   std::array<Mat3x4<float>, MaxPnMtx> pos;
+  bool taken = false;  // matched by a draw this frame (in prev)
+  float gap2 = -1.f;   // squared distance to the nearest other copy (in prev; -1 not yet)
 };
 struct XrMotionHistory {
   uint64_t seq = 0;
-  std::unordered_map<uint64_t, XrPrevMatrices> prev, cur;
-  std::unordered_map<uint64_t, uint32_t> seen; // this frame's draws per content key
+  std::unordered_map<uint64_t, std::vector<XrPrevMatrices>> prev, cur;
 } sXrMotion;
+// Over this many draws of the same thing, nearest-matching costs too much;
+// they go by order.
+constexpr size_t kXrNearestMax = 64;
+float xr_dist2(const Mat3x4<float>& a, const Mat3x4<float>& b) noexcept {
+  const float dx = a.m0[3] - b.m0[3], dy = a.m1[3] - b.m1[3], dz = a.m2[3] - b.m2[3];
+  return dx * dx + dy * dy + dz * dz;
+}
 } // namespace
 
 static u32 xr_prev_matrices(const u8* raw, size_t bytes, GXVtxFmt fmt) noexcept {
@@ -1327,38 +1341,71 @@ static u32 xr_prev_matrices(const u8* raw, size_t bytes, GXVtxFmt fmt) noexcept 
     if (!consecutive)
       h.prev.clear();
     h.cur.clear();
-    h.seen.clear();
   }
   const auto& state = g_gxState;
   uint64_t content = XXH3_64bits_withSeed(raw, bytes, fmt);
   content ^= reinterpret_cast<uintptr_t>(state.arrays[GX_VA_POS].data) * 0x9E3779B97F4A7C15ull;
-  const uint64_t key = content + 0x632BE59BD9B4E019ull * h.seen[content]++;
   XrPrevMatrices now;
   for (u32 i = 0; i < MaxPnMtx; ++i)
     now.pos[i] = state.pnMtx[i].pos;
-  const auto it = h.prev.find(key);
-  h.cur.insert_or_assign(key, now);
+  auto& mine = h.cur[content];
+  const size_t order = mine.size();
+  mine.push_back(now);
+  const u32 m = std::min<u32>(state.currentPnMtx, MaxPnMtx - 1);
+  XrPrevMatrices* found = nullptr;
+  float found2 = 0.f;
+  if (const auto it = h.prev.find(content); it != h.prev.end()) {
+    auto& last = it->second;
+    if (last.size() == 1) {
+      found = &last[0];
+      found2 = xr_dist2(found->pos[m], now.pos[m]);
+    } else if (last.size() > kXrNearestMax) {
+      if (order < last.size()) {
+        found = &last[order];
+        found2 = xr_dist2(found->pos[m], now.pos[m]);
+      }
+    } else {
+      if (last[0].gap2 < 0.f) {
+        for (auto& p : last) {
+          p.gap2 = std::numeric_limits<float>::max();
+          for (const auto& q : last)
+            if (&p != &q)
+              p.gap2 = std::min(p.gap2, xr_dist2(p.pos[m], q.pos[m]));
+        }
+      }
+      for (auto& p : last) {
+        if (p.taken)
+          continue;
+        // Copies drawn at one spot (a model drawn twice) have no gap: the
+        // cut's limit only.
+        const float d = xr_dist2(p.pos[m], now.pos[m]);
+        const float limit = p.gap2 < 1e-4f ? 40.f * 40.f : p.gap2 * 0.25f;
+        if (d < limit && (found == nullptr || d < found2)) {
+          found = &p;
+          found2 = d;
+        }
+      }
+    }
+  }
   // AURORA_XR_MOTION_STATS=1: how many opaque world draws found themselves
   // in last frame, every 20000.
   static const bool stats = std::getenv("AURORA_XR_MOTION_STATS") != nullptr;
   if (stats) {
-    static u32 found, n;
-    found += it != h.prev.end() ? 1 : 0;
+    static u32 matched, n;
+    matched += found != nullptr ? 1 : 0;
     if (++n % 20000 == 0) {
-      Log.info("XR motion: {} of {} opaque world draws matched last frame's", found, n);
-      found = n = 0;
+      Log.info("XR motion: {} of {} opaque world draws matched last frame's", matched, n);
+      matched = n = 0;
     }
   }
-  if (it == h.prev.end())
+  if (found == nullptr)
     return 0;
+  found->taken = true;
   // A jump of over 40 units (camera space) in the draw's own matrix is a
   // cut, not motion.
-  const auto& a = it->second.pos[std::min<u32>(state.currentPnMtx, MaxPnMtx - 1)];
-  const auto& b = now.pos[std::min<u32>(state.currentPnMtx, MaxPnMtx - 1)];
-  const float dx = a.m0[3] - b.m0[3], dy = a.m1[3] - b.m1[3], dz = a.m2[3] - b.m2[3];
-  if (dx * dx + dy * dy + dz * dz > 40.f * 40.f)
+  if (found2 > 40.f * 40.f)
     return 0;
-  const auto range = gfx::push_storage(reinterpret_cast<const u8*>(it->second.pos.data()), sizeof(it->second.pos));
+  const auto range = gfx::push_storage(reinterpret_cast<const u8*>(found->pos.data()), sizeof(found->pos));
   return range.offset / sizeof(u32) + 1; // 0 is none
 }
 
