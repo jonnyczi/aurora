@@ -28,6 +28,7 @@ EM_JS(void, browser_graphics_progress, (unsigned done, unsigned total), {
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -41,6 +42,10 @@ EM_JS(void, browser_graphics_progress, (unsigned done, unsigned total), {
 
 #include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_iostream.h>
+#if defined(__ANDROID__) || defined(__linux__)
+#include <dlfcn.h>
+#include <link.h>
+#endif
 #include <SDL3/SDL_thread.h>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
@@ -73,6 +78,7 @@ struct PipelineCacheWrite {
   ByteBuffer config;
   uint32_t firstFrameUsed = UINT32_MAX;
   bool deviceBuilt = false; // only marks (type, hash) in pipeline_device
+  bool built = false;       // only marks (type, hash, layoutKey) in pipeline_built
   // A (config, layout) pair a draw asked for (pipeline_pair), with its layout
   // (pipeline_layout): what precompile_recorded_pipelines builds.
   bool pair = false;
@@ -134,6 +140,17 @@ constexpr bool DeviceBuiltRowsOnly = false;
 #endif
 static std::mutex g_deviceBuiltMutex;
 static absl::flat_hash_set<HashType> g_deviceBuilt; // cache keys marked in pipeline_device
+/* Android: the (config, layout) pairs built in a process of this app build on
+ * this GPU driver (pipeline_built, keyed by g_buildKey). A build lands in
+ * Dawn's blob cache, so the Quest launcher's precompile (which exists only to
+ * fill that cache for the game process) builds just the pairs not marked:
+ * everything on a fresh install or after an app or driver update, nothing on
+ * a warm boot (it walked all ~11000 there, 33 s of cache hits), and nothing
+ * for pairs the game built in play. */
+constexpr bool TrackBuiltPairs = DeviceBuiltRowsOnly;
+static HashType g_buildKey = 0;
+static std::mutex g_builtPairsMutex;
+static absl::flat_hash_set<HashType> g_builtPairs; // xxh3(layout key, cache key) marked this process
 
 static bool env_flag(const char* name) {
   const char* v = std::getenv(name);
@@ -167,6 +184,7 @@ static sqlite3* g_pipelineCacheDb = nullptr;
 static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
 static sqlite3_stmt* g_pipelineCacheUpsertStmt = nullptr;
 static sqlite3_stmt* g_pipelineDeviceStmt = nullptr;
+static sqlite3_stmt* g_pipelineBuiltStmt = nullptr;
 static sqlite3_stmt* g_pipelinePairStmt = nullptr;
 static sqlite3_stmt* g_pipelineLayoutStmt = nullptr;
 // Pairs recorded (or loaded as recorded) this session, by runtime key.
@@ -544,6 +562,22 @@ static void mark_device_built(ShaderType type, HashType cacheKey) {
   enqueue_pipeline_cache_write(PipelineCacheWrite{.type = type, .hash = cacheKey, .deviceBuilt = true});
 }
 
+/* A pipeline for config `cacheKey` in layout `layoutKey` was built (and so is
+ * in Dawn's cache): marked once a process (TrackBuiltPairs). */
+static void mark_pair_built(ShaderType type, HashType cacheKey, uint64_t layoutKey) {
+  if constexpr (!TrackBuiltPairs) {
+    return;
+  }
+  {
+    std::lock_guard lock{g_builtPairsMutex};
+    if (!g_builtPairs.insert(xxh3_hash(layoutKey, cacheKey)).second) {
+      return;
+    }
+  }
+  enqueue_pipeline_cache_write(
+      PipelineCacheWrite{.type = type, .hash = cacheKey, .built = true, .layoutKey = layoutKey});
+}
+
 /* A draw asked for config `cacheKey` in `layout`: kept, once, so another
  * process (the Quest launcher) can build exactly the pipelines the game uses,
  * eye, batch and motion layouts included, which the known-config queue never
@@ -734,6 +768,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& c
                      layout.xrSoftClip, layout.colorAttachmentCount);
         }
         mark_device_built(type, cacheKey);
+        mark_pair_built(type, cacheKey, layout.key);
         return pipeline;
       },
       priority);
@@ -749,6 +784,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig
       [type, cacheKey, config, layout] {
         auto pipeline = create_pipeline(config, layout);
         mark_device_built(type, cacheKey);
+        mark_pair_built(type, cacheKey, layout.key);
         return pipeline;
       },
       priority);
@@ -778,6 +814,10 @@ static void pipeline_cache_abort() {
   if (g_pipelineCacheUpsertStmt != nullptr) {
     sqlite3_finalize(g_pipelineCacheUpsertStmt);
     g_pipelineCacheUpsertStmt = nullptr;
+  }
+  if (g_pipelineBuiltStmt != nullptr) {
+    sqlite3_finalize(g_pipelineBuiltStmt);
+    g_pipelineBuiltStmt = nullptr;
   }
   if (g_pipelineDeviceStmt != nullptr) {
     sqlite3_finalize(g_pipelineDeviceStmt);
@@ -859,6 +899,48 @@ static sqlite3* open_pipeline_cache_seed_db(const std::string& path) {
   }
 
   return seedDb;
+}
+
+/* Copies a seed table's rows into this database through `insert` (column for
+ * column, integers and blobs): the recorded pairs, their layouts and the
+ * built-on-device marks. A seed without the table (an older one) has none to
+ * give. Returns false on a write failure. */
+static bool copy_seed_table(sqlite3* seedDb, const char* select, sqlite3_stmt* insert, const char* what,
+                            uint32_t& copied) {
+  if (insert == nullptr)
+    return true;
+  sqlite3_stmt* read = nullptr;
+  if (sqlite3_prepare_v2(seedDb, select, -1, &read, nullptr) != SQLITE_OK) {
+    Log.info("Bundled pipeline cache has no {} to merge", what);
+    return true;
+  }
+  bool ok = true;
+  while (ok && sqlite3_step(read) == SQLITE_ROW) {
+    const int columns = sqlite3_column_count(read);
+    for (int c = 0; c < columns && ok; ++c) {
+      switch (sqlite3_column_type(read, c)) {
+      case SQLITE_INTEGER:
+        ok = sqlite3_bind_int64(insert, c + 1, sqlite3_column_int64(read, c)) == SQLITE_OK;
+        break;
+      case SQLITE_BLOB:
+        ok = sqlite3_bind_blob(insert, c + 1, sqlite3_column_blob(read, c), sqlite3_column_bytes(read, c),
+                               SQLITE_TRANSIENT) == SQLITE_OK;
+        break;
+      default:
+        ok = false;
+        break;
+      }
+    }
+    ok = ok && sqlite3_step(insert) == SQLITE_DONE;
+    sqlite3_reset(insert);
+    sqlite3_clear_bindings(insert);
+    if (ok)
+      ++copied;
+  }
+  sqlite3_finalize(read);
+  if (!ok)
+    Log.error("Failed to merge the bundled pipeline cache's {}: {}", what, sqlite3_errmsg(g_pipelineCacheDb));
+  return ok;
 }
 
 static void seed_pipeline_cache() {
@@ -957,6 +1039,25 @@ static void seed_pipeline_cache() {
       Log.warn("Failed while reading bundled pipeline cache rows from '{}': {}", usedPath, sqlite3_errmsg(seedDb));
       readFailed = true;
     }
+    /* A seed recorded on the hardware its build ships to (the Quest APK's,
+     * from a Quest 3) also gives the pairs its draws asked for, which the
+     * launcher precompiles, and its built-on-device marks, without which
+     * DeviceBuiltRowsOnly would drop every seeded row at load. Not this
+     * device's pipeline_built: its Dawn cache is still empty. */
+    uint32_t pairs = 0, layouts = 0, marks = 0;
+    if (!writeFailed && !readFailed) {
+      sqlite3_finalize(seedStmt);
+      seedStmt = nullptr;
+      writeFailed =
+          !copy_seed_table(seedDb, "SELECT key, layout FROM pipeline_layout", g_pipelineLayoutStmt, "layouts",
+                           layouts) ||
+          !copy_seed_table(seedDb, "SELECT type, hash, layout_key, first_frame_used FROM pipeline_pair",
+                           g_pipelinePairStmt, "recorded pairs", pairs) ||
+          (DeviceBuiltRowsOnly && !copy_seed_table(seedDb, "SELECT type, hash FROM pipeline_device",
+                                                   g_pipelineDeviceStmt, "built-on-device marks", marks));
+    }
+    if (pairs + layouts + marks > 0)
+      Log.info("Seeded {} recorded pairs, {} layouts and {} built-on-device marks", pairs, layouts, marks);
 
     if (!writeFailed && !readFailed) {
       tx.commit();
@@ -1101,6 +1202,24 @@ INSERT INTO aurora_schema VALUES ({});)",
     }
     if (ret != SQLITE_OK) {
       Log.error("Failed to prepare pipeline_device table: {}", sqlite3_errmsg(g_pipelineCacheDb));
+      pipeline_cache_abort();
+      return false;
+    }
+  }
+
+  if constexpr (TrackBuiltPairs) {
+    ret = sqlite::exec(g_pipelineCacheDb,
+                       "CREATE TABLE IF NOT EXISTS pipeline_built ("
+                       "type INTEGER NOT NULL, hash INTEGER NOT NULL, layout_key INTEGER NOT NULL, "
+                       "build_key INTEGER NOT NULL, PRIMARY KEY (type, hash, layout_key)) WITHOUT ROWID;");
+    if (ret == SQLITE_OK) {
+      ret = sqlite3_prepare_v3(g_pipelineCacheDb,
+                               "INSERT INTO pipeline_built (type, hash, layout_key, build_key) VALUES (?, ?, ?, ?) "
+                               "ON CONFLICT(type, hash, layout_key) DO UPDATE SET build_key = excluded.build_key",
+                               -1, SQLITE_PREPARE_PERSISTENT, &g_pipelineBuiltStmt, nullptr);
+    }
+    if (ret != SQLITE_OK) {
+      Log.error("Failed to prepare pipeline_built table: {}", sqlite3_errmsg(g_pipelineCacheDb));
       pipeline_cache_abort();
       return false;
     }
@@ -1254,6 +1373,28 @@ static bool write_device_built_record(const PipelineCacheWrite& write) {
   return ret == SQLITE_OK;
 }
 
+static bool write_built_record(const PipelineCacheWrite& write) {
+  int ret = sqlite3_bind_int(g_pipelineBuiltStmt, 1, underlying(write.type));
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_bind_int64(g_pipelineBuiltStmt, 2, static_cast<sqlite3_int64>(write.hash));
+  }
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_bind_int64(g_pipelineBuiltStmt, 3, static_cast<sqlite3_int64>(write.layoutKey));
+  }
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_bind_int64(g_pipelineBuiltStmt, 4, static_cast<sqlite3_int64>(g_buildKey));
+  }
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_step(g_pipelineBuiltStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+  }
+  if (ret != SQLITE_OK) {
+    Log.error("Failed to mark pipeline as built for this build and driver: {}", sqlite3_errmsg(g_pipelineCacheDb));
+  }
+  sqlite3_reset(g_pipelineBuiltStmt);
+  sqlite3_clear_bindings(g_pipelineBuiltStmt);
+  return ret == SQLITE_OK;
+}
+
 static bool write_pair_record(const PipelineCacheWrite& write) {
   int ret = sqlite3_bind_int64(g_pipelineLayoutStmt, 1, static_cast<sqlite3_int64>(write.layoutKey));
   if (ret == SQLITE_OK) {
@@ -1315,6 +1456,7 @@ static void pipeline_cache_writer() {
         for (const auto& write : batch) {
           const bool ok = write.pair          ? write_pair_record(write)
                           : write.deviceBuilt ? write_device_built_record(write)
+                          : write.built       ? write_built_record(write)
                                               : write_pipeline_cache_record(write);
           if (!ok) {
             writeFailed = true;
@@ -1538,7 +1680,9 @@ struct RecordedPair {
 
 // Every recorded pair this build can still use, in the order draws first asked
 // for them.
-static std::vector<RecordedPair> load_recorded_pairs() {
+/* unbuiltOnly: just the pairs not marked built for this app build and driver
+ * (pipeline_built; the Quest launcher's precompile). */
+static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
   std::vector<RecordedPair> jobs;
   {
     absl::flat_hash_map<uint64_t, RenderTargetLayout> layouts;
@@ -1555,11 +1699,19 @@ static std::vector<RecordedPair> load_recorded_pairs() {
     }
     sqlite3_finalize(stmt);
     stmt = nullptr;
-    if (sqlite3_prepare_v2(g_pipelineCacheDb,
-                           "SELECT p.type, p.layout_key, c.config FROM pipeline_pair p "
-                           "JOIN pipeline_cache c ON c.type = p.type AND c.hash = p.hash "
-                           "ORDER BY p.first_frame_used",
-                           -1, &stmt, nullptr) == SQLITE_OK) {
+    const char* sql = unbuiltOnly && TrackBuiltPairs
+                          ? "SELECT p.type, p.layout_key, c.config FROM pipeline_pair p "
+                            "JOIN pipeline_cache c ON c.type = p.type AND c.hash = p.hash "
+                            "LEFT JOIN pipeline_built b ON b.type = p.type AND b.hash = p.hash "
+                            "AND b.layout_key = p.layout_key "
+                            "WHERE b.build_key IS NULL OR b.build_key != ?1 "
+                            "ORDER BY p.first_frame_used"
+                          : "SELECT p.type, p.layout_key, c.config FROM pipeline_pair p "
+                            "JOIN pipeline_cache c ON c.type = p.type AND c.hash = p.hash "
+                            "ORDER BY p.first_frame_used";
+    if (sqlite3_prepare_v2(g_pipelineCacheDb, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+      if (unbuiltOnly && TrackBuiltPairs)
+        sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(g_buildKey));
       while (sqlite3_step(stmt) == SQLITE_ROW) {
         const auto type = static_cast<ShaderType>(sqlite3_column_int(stmt, 0));
         const auto layoutIt = layouts.find(static_cast<uint64_t>(sqlite3_column_int64(stmt, 1)));
@@ -1655,9 +1807,10 @@ void rebuild_pipeline_cache() {
  * process's cache key (xr::add_required_features), so pipelines it builds are
  * the game's cache hits. The pipelines themselves are dropped. */
 static void precompile_recorded_pipelines(unsigned threads) {
-  const auto jobs = load_recorded_pairs();
+  const auto jobs = load_recorded_pairs(true);
   g_precompileTotal = jobs.size();
-  Log.info("Precompiling {} recorded pipelines on {} thread(s)", jobs.size(), threads);
+  Log.info("Precompiling {} recorded pipelines on {} thread(s){}", jobs.size(), threads,
+           TrackBuiltPairs ? " (the rest are built for this app and driver)" : "");
   {
     absl::flat_hash_map<uint64_t, std::pair<const RenderTargetLayout*, size_t>> perLayout;
     for (const auto& job : jobs) {
@@ -1674,7 +1827,13 @@ static void precompile_recorded_pipelines(unsigned threads) {
   std::atomic_size_t next{0}, done{0};
   const auto work = [&] {
     for (size_t i = next++; i < jobs.size() && !g_precompileStop; i = next++) {
-      std::visit([&](const auto& config) { (void)create_pipeline(config, jobs[i].layout); }, jobs[i].config);
+      std::visit(
+          [&](const auto& config) {
+            (void)create_pipeline(config, jobs[i].layout);
+            mark_pair_built(jobs[i].type, xxh3_hash(config, static_cast<HashType>(jobs[i].type)),
+                            jobs[i].layout.key);
+          },
+          jobs[i].config);
       ++g_precompileDone;
       if (const size_t n = ++done; n % 250 == 0)
         Log.info("Precompiled {} of {} pipelines ({:.1f} s)", n, jobs.size(),
@@ -1694,7 +1853,75 @@ static void precompile_recorded_pipelines(unsigned threads) {
     Log.info("pipeline compile time: {}", line);
 }
 
+/* This library's GNU build ID, hashed: it changes with every build, as the
+ * shaders Aurora generates (and so Dawn's cache keys) may. 0 without one. */
+static HashType module_build_id() {
+#if defined(__ANDROID__) || defined(__linux__)
+  struct Search {
+    uintptr_t addr;
+    HashType id = 0;
+  } search{reinterpret_cast<uintptr_t>(&module_build_id)};
+  dl_iterate_phdr(
+      [](dl_phdr_info* info, size_t, void* data) -> int {
+        auto& find = *static_cast<Search*>(data);
+        bool mine = false;
+        for (int i = 0; i < info->dlpi_phnum && !mine; ++i) {
+          const auto& ph = info->dlpi_phdr[i];
+          mine = ph.p_type == PT_LOAD && find.addr >= info->dlpi_addr + ph.p_vaddr &&
+                 find.addr < info->dlpi_addr + ph.p_vaddr + ph.p_memsz;
+        }
+        if (!mine)
+          return 0;
+        for (int i = 0; i < info->dlpi_phnum; ++i) {
+          const auto& ph = info->dlpi_phdr[i];
+          if (ph.p_type != PT_NOTE)
+            continue;
+          const auto* p = reinterpret_cast<const uint8_t*>(info->dlpi_addr + ph.p_vaddr);
+          const auto* end = p + ph.p_memsz;
+          while (p + sizeof(ElfW(Nhdr)) <= end) {
+            const auto* note = reinterpret_cast<const ElfW(Nhdr)*>(p);
+            const auto* name = p + sizeof(ElfW(Nhdr));
+            const auto* desc = name + ((note->n_namesz + 3) & ~3u);
+            if (note->n_type == NT_GNU_BUILD_ID && note->n_namesz == 4 && std::memcmp(name, "GNU", 4) == 0 &&
+                desc + note->n_descsz <= end) {
+              find.id = xxh3_hash_s(desc, note->n_descsz, 0);
+              return 1;
+            }
+            p = desc + ((note->n_descsz + 3) & ~3u);
+          }
+        }
+        return 1;
+      },
+      &search);
+  return search.id;
+#else
+  return 0;
+#endif
+}
+
+/* What pipeline_built marks are good for: this build (module_build_id, else
+ * the compile time) on this GPU and driver (Dawn's adapter description holds
+ * the driver version: a Quest OS update changes it, and Dawn's cache keys). */
+static HashType compute_build_key() {
+  const auto& info = webgpu::g_adapterInfo;
+  HashType key = module_build_id();
+  if (key == 0) {
+    static constexpr char Built[] = __DATE__ " " __TIME__;
+    key = xxh3_hash_s(Built, sizeof(Built), 0);
+  }
+  key = xxh3_hash_s(&info.vendorID, sizeof(info.vendorID), key);
+  key = xxh3_hash_s(&info.deviceID, sizeof(info.deviceID), key);
+  for (const wgpu::StringView text : {info.device, info.description, info.architecture}) {
+    if (text.data == nullptr)
+      continue;
+    const size_t len = text.length == WGPU_STRLEN ? std::strlen(text.data) : text.length;
+    key = xxh3_hash_s(text.data, len, key);
+  }
+  return key;
+}
+
 void initialize_pipeline_cache() {
+  g_buildKey = compute_build_key();
   g_pipelineCacheBroken = false;
   g_pipelineCacheWriterStop = false;
   g_pipelineThreadEnd = false;
@@ -1818,6 +2045,10 @@ void shutdown_pipeline_cache() {
   g_pipelineQueue.clear();
   g_backgroundPipelineQueue.clear();
   g_pendingPipelines.clear();
+  {
+    std::lock_guard lock{g_builtPairsMutex};
+    g_builtPairs.clear();
+  }
   g_deviceBuilt.clear();
 
   queuedPipelines = 0;
