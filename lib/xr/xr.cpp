@@ -433,6 +433,10 @@ std::array<PlacingClip, 6> g_placingClips;
 // full VR doesn't. The XR thread pauses or starts passthrough to match.
 std::atomic<bool> g_passthroughWanted{true};
 
+// The game's rumble motor (aurora_xr_set_rumble); the XR thread drives the
+// controllers' haptics to match.
+std::atomic<bool> g_rumbleWanted{false};
+
 // Controller input, written by the XR thread, read by the game thread.
 std::mutex g_padMutex;
 PADStatus g_pad{};
@@ -563,6 +567,8 @@ struct Bridge {
   // Pointing and grabbing the arena while a fight is paused.
   std::array<XrAction, 2> aim{}, grab{};
   std::array<XrSpace, 2> aimSpace{};
+  // The game's rumble, on both controllers' haptics (aurora_xr_set_rumble).
+  XrAction rumble = XR_NULL_HANDLE;
   // Uploads to static swapchains still on the GPU: freed once their fence
   // signals (free_finished_uploads), never waited on mid-session.
   struct Upload {
@@ -1396,7 +1402,7 @@ XrPath path(const char* str) {
   return p;
 }
 
-bool suggest(const char* profile, std::initializer_list<std::pair<XrAction, const char*>> bindings) {
+bool suggest(const char* profile, const std::vector<std::pair<XrAction, const char*>>& bindings) {
   std::vector<XrActionSuggestedBinding> sb;
   for (const auto& [action, binding] : bindings)
     sb.push_back({action, path(binding)});
@@ -1431,24 +1437,38 @@ bool create_input() {
       !create_action(B.grab[1], "grab_right", "Right grab", XR_ACTION_TYPE_FLOAT_INPUT))
     return false;
 
-  const bool touch = suggest("/interaction_profiles/oculus/touch_controller",
-                             {
-                                 {B.stickMain, "/user/hand/left/input/thumbstick"},
-                                 {B.stickC, "/user/hand/right/input/thumbstick"},
-                                 {B.btnA, "/user/hand/right/input/a/click"},
-                                 {B.btnB, "/user/hand/right/input/b/click"},
-                                 {B.btnX, "/user/hand/left/input/x/click"},
-                                 {B.btnY, "/user/hand/left/input/y/click"},
-                                 {B.btnZ, "/user/hand/left/input/squeeze/value"},
-                                 {B.btnZ, "/user/hand/right/input/squeeze/value"},
-                                 {B.btnStart, "/user/hand/left/input/menu/click"},
-                                 {B.trigL, "/user/hand/left/input/trigger/value"},
-                                 {B.trigR, "/user/hand/right/input/trigger/value"},
-                                 {B.aim[0], "/user/hand/left/input/aim/pose"},
-                                 {B.aim[1], "/user/hand/right/input/aim/pose"},
-                                 {B.grab[0], "/user/hand/left/input/squeeze/value"},
-                                 {B.grab[1], "/user/hand/right/input/squeeze/value"},
-                             });
+  std::vector<std::pair<XrAction, const char*>> touchBindings{
+      {B.stickMain, "/user/hand/left/input/thumbstick"},
+      {B.stickC, "/user/hand/right/input/thumbstick"},
+      {B.btnA, "/user/hand/right/input/a/click"},
+      {B.btnB, "/user/hand/right/input/b/click"},
+      {B.btnX, "/user/hand/left/input/x/click"},
+      {B.btnY, "/user/hand/left/input/y/click"},
+      {B.btnZ, "/user/hand/left/input/squeeze/value"},
+      {B.btnZ, "/user/hand/right/input/squeeze/value"},
+      {B.btnStart, "/user/hand/left/input/menu/click"},
+      {B.trigL, "/user/hand/left/input/trigger/value"},
+      {B.trigR, "/user/hand/right/input/trigger/value"},
+      {B.aim[0], "/user/hand/left/input/aim/pose"},
+      {B.aim[1], "/user/hand/right/input/aim/pose"},
+      {B.grab[0], "/user/hand/left/input/squeeze/value"},
+      {B.grab[1], "/user/hand/right/input/squeeze/value"},
+  };
+  // The game's rumble on both controllers' haptics. Suggested with the pad's
+  // bindings (a later suggestion for a profile replaces the earlier one), and
+  // the pad alone again if the runtime turns that down.
+  bool touch = false;
+  if (create_action(B.rumble, "rumble", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT)) {
+    auto withHaptics = touchBindings;
+    withHaptics.push_back({B.rumble, "/user/hand/left/output/haptic"});
+    withHaptics.push_back({B.rumble, "/user/hand/right/output/haptic"});
+    touch = suggest("/interaction_profiles/oculus/touch_controller", withHaptics);
+  }
+  if (!touch) {
+    B.rumble = XR_NULL_HANDLE;
+    Log.warn("Touch controller haptics not bound: no rumble");
+    touch = suggest("/interaction_profiles/oculus/touch_controller", touchBindings);
+  }
   // Pointing and grabbing only, no pad buttons: the Quest reports bare
   // hands as this profile, select being a pinch, and a pinch must grab,
   // not press A or B. (Monado's keyboard/mouse controllers come through it
@@ -1518,8 +1538,44 @@ XrVector2f action_vec2(XrAction a) {
 
 s8 to_axis(float v) { return static_cast<s8>(std::lround(std::clamp(v, -1.f, 1.f) * 127.f)); }
 
+// The game's rumble on the controllers (XR thread, after xrSyncActions). A
+// GameCube motor is on or off, with no length, so while it is on each
+// controller gets a vibration that outlasts the next display frame and is
+// renewed before it ends; off stops it at once. AURORA_XR_RUMBLE is the
+// strength, 0..1 (0 turns it off).
+void update_rumble(bool focused) {
+  using namespace std::chrono;
+  static const float amplitude = std::clamp(env_float("AURORA_XR_RUMBLE", 0.7f), 0.f, 1.f);
+  static bool on = false;
+  static steady_clock::time_point renewed{};
+  // The runtime stops haptics itself when the session loses focus.
+  if (!focused) {
+    on = false;
+    return;
+  }
+  if (B.rumble == XR_NULL_HANDLE)
+    return;
+  XrHapticActionInfo hi{XR_TYPE_HAPTIC_ACTION_INFO};
+  hi.action = B.rumble;
+  const bool want = g_rumbleWanted.load(std::memory_order_relaxed) && amplitude > 0.f;
+  const auto now = steady_clock::now();
+  if (want && (!on || now - renewed >= 100ms)) {
+    XrHapticVibration v{XR_TYPE_HAPTIC_VIBRATION};
+    v.duration = duration_cast<nanoseconds>(200ms).count();
+    v.frequency = XR_FREQUENCY_UNSPECIFIED;
+    v.amplitude = amplitude;
+    xrApplyHapticFeedback(B.session, &hi, reinterpret_cast<const XrHapticBaseHeader*>(&v));
+    on = true;
+    renewed = now;
+  } else if (!want && on) {
+    xrStopHapticFeedback(B.session, &hi);
+    on = false;
+  }
+}
+
 void update_input() {
   if (!B.actionSet || !B.focused) {
+    update_rumble(false);
     std::lock_guard lock{g_padMutex};
     g_padValid = false;
     return;
@@ -1530,6 +1586,7 @@ void update_input() {
   sync.activeActionSets = &active;
   if (XR_FAILED(xrSyncActions(B.session, &sync)))
     return;
+  update_rumble(true);
   PADStatus pad{};
   const XrVector2f main = action_vec2(B.stickMain);
   const XrVector2f c = action_vec2(B.stickC);
@@ -9959,6 +10016,10 @@ void shutdown() noexcept {
 }
 
 } // namespace aurora::xr
+
+extern "C" void aurora_xr_set_rumble(bool on) {
+  aurora::xr::g_rumbleWanted.store(on, std::memory_order_relaxed);
+}
 
 extern "C" bool aurora_xr_get_pad(PADStatus* out) {
   std::lock_guard lock{aurora::xr::g_padMutex};
