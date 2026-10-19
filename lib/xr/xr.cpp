@@ -826,7 +826,8 @@ bool create_instance() {
   aci.applicationActivity = activity;
   ci.next = &aci;
 #endif
-  std::strncpy(ci.applicationInfo.applicationName, "melee-pc", XR_MAX_APPLICATION_NAME_SIZE - 1);
+  std::strncpy(ci.applicationInfo.applicationName, g_config.appName != nullptr ? g_config.appName : "aurora",
+               XR_MAX_APPLICATION_NAME_SIZE - 1);
   std::strncpy(ci.applicationInfo.engineName, "aurora", XR_MAX_ENGINE_NAME_SIZE - 1);
   ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;
   ci.enabledExtensionCount = static_cast<uint32_t>(exts.size());
