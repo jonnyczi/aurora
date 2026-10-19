@@ -804,10 +804,12 @@ bool create_instance() {
                       env_float("AURORA_XR_GRADE_LUT", 16.f) >= 2.f;
   if (B.hasColorLutExt)
     exts.push_back(XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME);
-  // The stage spot kept in the room (offered to apps declaring
-  // USE_ANCHOR_API); AURORA_XR_ANCHORS=0 leaves it to the launch.
+  // The stage spot kept in the room across launches (offered to apps
+  // declaring USE_ANCHOR_API): off, AURORA_XR_ANCHORS=1 turns it on. Off, a
+  // placement lasts the launch, and a recenter's own report keeps the stage
+  // in its place in the room (spot_recentered).
   const bool anchorExts = B.hasSpatialEntityExt && B.hasSpacePersistenceExt && B.hasSpaceDiscoveryExt &&
-                          env_flag("AURORA_XR_ANCHORS", true);
+                          env_flag("AURORA_XR_ANCHORS", false);
   B.hasSpatialEntityExt &= anchorExts;
   B.hasSpacePersistenceExt &= anchorExts;
   B.hasSpaceDiscoveryExt &= anchorExts;
