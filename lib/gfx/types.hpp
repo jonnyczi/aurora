@@ -27,8 +27,12 @@ enum class XrCategory : uint8_t {
   Hidden = 3, // fight geometry left out of 3D: flat frame only, dropped with World
 };
 // World draws can carry an extra placement in the 3D view
-// (aurora_xr_world_transform): index 0 is none, 1.. index the frame's list.
-constexpr uint32_t XrMaxTransforms = 8;
+// (aurora_xr_world_transform) and clip planes: index 0 is none, 1.. index the
+// frame's list of distinct (placement, clip) entries. A draw past a full list
+// goes out with neither: at 8, Great Bay (its turtle's, pier's and sea's cuts,
+// the sea's move, fades) overflowed, and its sea flashed out to the horizon.
+// Each entry is a small per-eye uniform buffer, written only when used.
+constexpr uint32_t XrMaxTransforms = 32;
 // Clip planes a world draw can carry (aurora_xr_world_clips4_fade). Their
 // distances ride to the fragment shader four to a vec4.
 constexpr int XrMaxClipPlanes = 8;

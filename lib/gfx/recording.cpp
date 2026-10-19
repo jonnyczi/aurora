@@ -1493,6 +1493,12 @@ void update_xr_transform() {
     } else if (list.size() + 1 < XrMaxTransforms) {
       list.push_back(entry);
       index = static_cast<uint8_t>(list.size());
+    } else {
+      // The table is full: this draw goes out with no move and no clip.
+      static uint32_t warned = 0;
+      if (warned++ % 600 == 0)
+        Log.warn("XR: a frame needs more than {} world transforms; draws past them lose their move and clip",
+                 XrMaxTransforms - 1);
     }
   }
   if (index != g_recorder.xrTransform) {
