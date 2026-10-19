@@ -5202,6 +5202,28 @@ bool spot_event(const XrEventDataBuffer& ev) {
   }
 }
 
+// Whether a point (in B.space) is inside either eye's view: 1 yes, 0 no, -1
+// no views yet.
+int in_view(XrVector3f p) {
+  std::array<XrView, 2> views;
+  {
+    std::lock_guard lock{g_viewMutex};
+    if (!g_viewsValid)
+      return -1;
+    views = g_latestViews;
+  }
+  for (const XrView& v : views) {
+    const XrVector3f l = qrot(qconj(v.pose.orientation), p - v.pose.position);
+    if (l.z > -0.05f)
+      continue;
+    const float x = l.x / -l.z, y = l.y / -l.z;
+    if (x >= std::tan(v.fov.angleLeft) && x <= std::tan(v.fov.angleRight) && y >= std::tan(v.fov.angleDown) &&
+        y <= std::tan(v.fov.angleUp))
+      return 1;
+  }
+  return 0;
+}
+
 // XR thread, every frame while the session runs.
 void spot_frame(XrTime time) {
   if (!B.anchors || !B.running || time == 0)
@@ -5259,6 +5281,9 @@ void spot_frame(XrTime time) {
     return true;
   };
   // Saved spots, until one is found here (or the player places one first).
+  // One counts only if it's in view the first time it's located: a spot
+  // saved in another room can still be located through the walls (the same
+  // space map), and took the stage there.
   if (!g_spot.candidates.empty()) {
     bool adopted;
     {
@@ -5270,6 +5295,17 @@ void spot_frame(XrTime time) {
       float yaw;
       if (!locate(g_spot.candidates[i].space, pos, yaw))
         continue;
+      const int seen = in_view(pos);
+      if (seen < 0)
+        continue;
+      if (seen == 0) {
+        Log.info("Stage spot: saved anchor {} is out of view ({:.1f} m away); not used this session",
+                 uuid_hex(g_spot.candidates[i].uuid), vlen(pos - B.head));
+        xrDestroySpace(g_spot.candidates[i].space);
+        g_spot.candidates.erase(g_spot.candidates.begin() + static_cast<long>(i));
+        --i;
+        continue;
+      }
       auto it = std::find_if(g_spot.saved.begin(), g_spot.saved.end(),
                              [&](const SpotSaved& s) { return uuid_equal(s.uuid, g_spot.candidates[i].uuid); });
       if (it == g_spot.saved.end())
@@ -5822,6 +5858,10 @@ bool upload_placing_image(PlacingImage& img) {
 
 constexpr size_t kMaxPlacingLayers = 2 + 3; // the cards, the legend, the clips
 
+// When LOCAL was last recentered (monotonic_ns): the placing cards start over
+// about the head, which the new space puts somewhere else.
+std::atomic<int64_t> g_recenteredNs{0};
+
 struct PlacingLayers {
   std::array<XrCompositionLayerQuad, kMaxPlacingLayers> quads;
   uint32_t count = 0;
@@ -5829,48 +5869,76 @@ struct PlacingLayers {
 
 void build_placing_layers(PlacingLayers& out, int mode) {
   out.count = 0;
-  const ArenaPose d = [] {
-    std::lock_guard lock{g_arenaMutex};
-    init_arena();
-    return g_defaultArena;
-  }();
-  // Where each sits against the arena's starting position, and its width
-  // (meters). AURORA_XR_PLACE_CARDS / _LEGEND: "dx,dy,dz,width".
+  // Where each sits against the head (x right, y up, z back, meters, turned
+  // with the layout's yaw), and its width: the cards an arm and a half
+  // ahead, about 35 degrees wide, above the middle of the view, and the
+  // legend well under it, so the two frame the stage being placed between
+  // them. AURORA_XR_PLACE_CARDS / _LEGEND: "dx,dy,dz,width".
   struct Spot {
     const char* env;
     XrVector3f offset;
     float width;
   };
-  const std::array<Spot, 2> spots{{{"AURORA_XR_PLACE_CARDS", {0.f, 0.42f, -0.3f}, 0.85f},
-                                    {"AURORA_XR_PLACE_LEGEND", {0.f, -0.17f, 0.12f}, 0.34f}}};
+  const std::array<Spot, 2> spots{{{"AURORA_XR_PLACE_CARDS", {0.f, 0.1f, -1.2f}, 0.75f},
+                                    {"AURORA_XR_PLACE_LEGEND", {0.f, -0.6f, -1.f}, 0.3f}}};
   // Soft head lock, sideways only: the layout turns about where the head
   // stood when the hold began, lagging behind once the head has turned past
-  // a dead zone, and settles when it catches up. Height and pitch stay put.
+  // a dead zone, and settles when it catches up; inside the dead zone it
+  // creeps back to center once the head has held still for a second and a
+  // half, unless it's looking at the cards (reading one at the side mustn't
+  // slide it away). Height and pitch stay put.
+  // The layout keeps to the head, not to any stage: the default arena isn't
+  // moved by a recenter and a placed stage is elsewhere, and measured from
+  // them the cards could end up at the player's face. A recenter, which
+  // moves the head in LOCAL, starts the turning over about the head, for the
+  // half second the new head pose takes to come.
   static auto last = std::chrono::steady_clock::time_point{};
   static float yaw = 0.f;
   static bool following = false;
+  static float still = 0.f; // seconds the head has turned under 10 deg/s
+  static float prevHeadYaw = 0.f;
   static XrVector3f pivot{};
   const auto now = std::chrono::steady_clock::now();
   const float dt = std::chrono::duration<float>(now - last).count();
   last = now;
   const XrVector3f fwd = qrot(B.headOrientation, {0.f, 0.f, -1.f});
   const float headYaw = std::atan2(-fwd.x, -fwd.z); // rot_y's sense
-  if (dt > 0.25f) { // a new hold: start where the head looks
+  const bool recentered = monotonic_ns() - g_recenteredNs.load(std::memory_order_relaxed) < 500'000'000;
+  constexpr float kPi = 3.14159265f;
+  const auto wrap = [&](float a) { return a - 2.f * kPi * std::floor((a + kPi) / (2.f * kPi)); };
+  // Whether the head's forward ray meets a picture where the layout puts it
+  // now, with a 10 cm margin (its height taken as half its width at most).
+  const auto looking_at = [&](const Spot& sp) {
+    const XrVector3f p = pivot + rot_y(sp.offset, yaw);
+    const XrVector3f n = vnorm(pivot - p);
+    const float facingRay = vdot(fwd, n);
+    if (facingRay > -1e-3f)
+      return false;
+    const XrVector3f hit = B.head + fwd * (vdot(p - B.head, n) / facingRay);
+    const XrVector3f local = hit - p;
+    const float across = vdot(local, rot_y({1.f, 0.f, 0.f}, yaw));
+    return std::fabs(across) < sp.width * 0.5f + 0.1f && std::fabs(local.y) < sp.width * 0.25f + 0.1f;
+  };
+  if (dt > 0.25f || recentered) { // a new hold, or a recenter: start where the head looks
     yaw = headYaw;
     following = false;
-    pivot = {B.head.x, 0.f, B.head.z};
+    still = 0.f;
+    pivot = B.head;
   } else {
-    constexpr float kPi = 3.14159265f;
-    float diff = headYaw - yaw;
-    diff -= 2.f * kPi * std::floor((diff + kPi) / (2.f * kPi));
+    const float turn = std::fabs(wrap(headYaw - prevHeadYaw)) / std::max(dt, 1e-3f);
+    still = turn < 10.f * kPi / 180.f ? still + dt : 0.f;
+    const float diff = wrap(headYaw - yaw);
     if (std::fabs(diff) > 20.f * kPi / 180.f)
       following = true;
     if (following) {
       yaw += diff * std::min(1.f, dt * 4.f);
       if (std::fabs(diff) < 1.f * kPi / 180.f)
         following = false;
+    } else if (still > 1.5f && !(mode >= 2 && looking_at(spots[0]))) {
+      yaw += diff * std::min(1.f, dt * 2.f); // the creep back
     }
   }
+  prevHeadYaw = headYaw;
   // Hands, if one is tracked (a controller put down), else controllers.
   const bool hands = G.hands[0].tracked || G.hands[1].tracked;
   std::lock_guard lock{g_placingMutex};
@@ -5894,7 +5962,7 @@ void build_placing_layers(PlacingLayers& out, int mode) {
     Spot spot = spots[which];
     if (const char* v = std::getenv(spot.env))
       std::sscanf(v, "%f,%f,%f,%f", &spot.offset.x, &spot.offset.y, &spot.offset.z, &spot.width);
-    const XrVector3f pos = pivot + rot_y(d.pos + spot.offset, yaw);
+    const XrVector3f pos = pivot + rot_y(spot.offset, yaw);
     const XrQuaternionf turn = facing(pos, pivot);
     const XrExtent2Df size{spot.width, spot.width * static_cast<float>(img->height) / static_cast<float>(img->width)};
     auto& q = out.quads[out.count++];
@@ -7498,6 +7566,7 @@ bool poll_events() {
       // stage keeps its place in the room.
       const auto& e = reinterpret_cast<const XrEventDataReferenceSpaceChangePending&>(ev);
       Log.info("Reference space {} recentered", static_cast<int>(e.referenceSpaceType));
+      g_recenteredNs.store(monotonic_ns(), std::memory_order_relaxed);
       spot_recentered(e);
       surface_request(1000, true);
       room_resurvey();
