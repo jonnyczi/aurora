@@ -225,6 +225,14 @@ void aurora_xr_camera(int category, const float view[3][4]);
  * FIFO ordering as aurora_xr_camera. */
 void aurora_xr_world_transform(const float m[3][4]);
 
+/* The following AURORA_XR_WORLD draws have no motion of their own for
+ * Application SpaceWarp while on: their depth goes in as fixed in the game
+ * world, moved by the head only, instead of each finding where it was last
+ * frame. For effects that jump rather than move (a burst whose pieces take a
+ * new random turn every few ticks), whose last-frame vectors SpaceWarp would
+ * extrapolate into smears. Same FIFO ordering as aurora_xr_camera. */
+void aurora_xr_world_still(bool on);
+
 /* Clip plane for the following AURORA_XR_WORLD draws in the 3D view only, in
  * game world units: geometry where a*x + b*y + c*z + d < 0 is cut away (e.g.
  * {0, 1, 0, -y0} keeps everything above y0). Applies with or without an

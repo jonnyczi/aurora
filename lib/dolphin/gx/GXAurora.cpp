@@ -50,6 +50,12 @@ void aurora_xr_camera(int category, const float view[3][4]) {
 
 void aurora_xr_world_transform(const float m[3][4]) { aurora_xr_camera(3, m); }
 
+// Category 9: on (a view) or off (none).
+void aurora_xr_world_still(bool on) {
+  static const float kOn[3][4] = {};
+  aurora_xr_camera(9, on ? kOn : nullptr);
+}
+
 void aurora_xr_world_clip(const float plane[4]) { aurora_xr_world_clip_soft(plane, 0.f); }
 
 void aurora_xr_world_clip_soft(const float plane[4], float fade) { aurora_xr_world_clips(plane, fade, nullptr, 0.f); }

@@ -1314,6 +1314,8 @@ struct XrMotionHistory {
   uint64_t seq = 0;
   std::unordered_map<uint64_t, std::vector<XrPrevMatrices>> prev, cur;
 } sXrMotion;
+// aurora_xr_world_still: the draws go in as fixed in the game world.
+bool sXrStill = false;
 // Over this many draws of the same thing, nearest-matching costs too much;
 // they go by order.
 constexpr size_t kXrNearestMax = 64;
@@ -1329,7 +1331,7 @@ static u32 xr_prev_matrices(const u8* raw, size_t bytes, GXVtxFmt fmt) noexcept 
     const char* v = std::getenv("AURORA_XR_APPSW_MATCH");
     return v == nullptr || *v != '0';
   }();
-  if (!match)
+  if (!match || sXrStill)
     return 0;
   ZoneScoped;
   auto& h = sXrMotion;
@@ -2084,6 +2086,8 @@ void handle_aurora(ByteReader& reader) noexcept {
       gfx::xr_set_world_clip(hasView ? view.data() : nullptr);
     } else if (category == 5 || category == 7 || category == 8) { // planes 3-4, 5-6, 7-8
       gfx::xr_set_world_clip_more(category == 5 ? 1 : category - 5, view.data());
+    } else if (category == 9) { // aurora_xr_world_still
+      sXrStill = hasView;
     } else {
       const auto cat = category <= 2 ? static_cast<gfx::XrCategory>(category)
                        : category == 6 ? gfx::XrCategory::Hidden // AURORA_XR_HIDDEN
