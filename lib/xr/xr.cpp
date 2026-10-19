@@ -3883,6 +3883,14 @@ const char* room_kind_name(RoomSurvey::Kind k) {
   return k == RoomSurvey::Kind::Desk ? "desk" : k == RoomSurvey::Kind::Couch ? "couch" : k == RoomSurvey::Kind::Room ? "room" : "unknown";
 }
 
+// The room survey (raycasts) choosing where stages and the screen start: off
+// for now, AURORA_XR_ROOM_SURVEY=1 turns it on. Its fits were often awkward to
+// work with, and Place Stage now sets where every stage starts; off, stages
+// start at the arena's default (0.7 m ahead, 0.25 m under the eyes, 0.0035 m
+// a unit: between the placing cards and their legend) and the screen at its
+// own. The stage shadow's surface casts don't depend on it.
+constexpr bool kRoomSurveyDefault = false;
+
 // Between the XR thread (and the game's setters) and the worker.
 struct SurfaceShared {
   std::mutex mutex;
@@ -4728,7 +4736,7 @@ void surface_frame(bool fight, bool placing, XrTime time) {
     std::lock_guard lock{g_viewMutex};
     viewsValid = g_viewsValid;
   }
-  static const bool survey = env_flag("AURORA_XR_ROOM_SURVEY", true);
+  static const bool survey = env_flag("AURORA_XR_ROOM_SURVEY", kRoomSurveyDefault);
   std::lock_guard lock{g_surface.mutex};
   g_surface.displayTime = time;
   g_surface.placing = placing;
@@ -4775,7 +4783,7 @@ struct {
 // than kept where it was in the room. A moment later, so the rays are all
 // cast in the new space.
 void room_resurvey() {
-  static const bool survey = env_flag("AURORA_XR_ROOM_SURVEY", true);
+  static const bool survey = env_flag("AURORA_XR_ROOM_SURVEY", kRoomSurveyDefault);
   if (!survey || !g_surfaceThread.joinable())
     return;
   g_resurvey.startNs = monotonic_ns() + 300 * kMsNs;
