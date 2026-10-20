@@ -1419,6 +1419,7 @@ static PipelineConfig xr_motion_config(const PipelineConfig& from) noexcept {
   c.shaderConfig.lineMode = sc.lineMode;
   c.shaderConfig.decodedPos = sc.decodedPos;
   c.shaderConfig.decodedAll = sc.decodedAll;
+  c.shaderConfig.xrSmoothNrm = sc.xrSmoothNrm; // in the decoded vertex: its stride
   c.shaderConfig.attrs = sc.attrs;
   c.shaderConfig.tevStageCount = 1; // one stage of zeros: nothing sampled, nothing lit
   c.blendMode = GX_BM_NONE;
