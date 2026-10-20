@@ -1373,6 +1373,10 @@ void xr_set_category(XrCategory category, const float* view3x4) {
 bool xr_recording_world() noexcept { return g_recorder.xrCategory == XrCategory::World; }
 bool xr_soft_clip_active() noexcept { return g_xrClip.has_value(); }
 
+static std::atomic<uint32_t> g_xrRoomLight{0};
+void set_xr_room_light(uint32_t bits) noexcept { g_xrRoomLight.store(bits, std::memory_order_relaxed); }
+uint32_t xr_room_light() noexcept { return g_xrRoomLight.load(std::memory_order_relaxed); }
+
 const XrClipCamera* xr_clip_camera() noexcept {
   if (!g_xrClip || !g_recorder.active()) {
     return nullptr;

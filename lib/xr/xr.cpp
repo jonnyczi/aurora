@@ -6012,6 +6012,178 @@ void build_placing_layers(PlacingLayers& out, int mode) {
   }
 }
 
+// ---------------------------------------------------------------- Room lighting (dev tools)
+//
+// An optional stand-in for the game's lighting in the 3D view: light from
+// the room around the stage, blended with the game's by a weight for the
+// fighters (and their items), one for the stage's lit draws and one for its
+// unlit ones (baked lighting), each 0 (the game's) to 1 (the room's). The
+// eye shaders take it (ShaderConfig::xrRoom*, set per draw from the game's
+// GX link markers; render_eyes fills the uniform). Until rooms are captured,
+// the room is one of a few presets: a sky gradient (up, horizon, down) in
+// SH L2, and a key and a fill light set against the stage (they turn with
+// it; YAW turns them about its up axis). Lighting is per vertex, as GX's
+// is, or per pixel for the room's part (a comparison, and its cost).
+//
+// AURORA_XR_ROOM_LIGHT "source,fighters,stage,unlit,strength,yaw,pixel,view"
+// (any leading part; source 0 off, 1 lamp, 2 day, 3 office; pixel 0 or 1;
+// view 0 off, 1 lit/unlit, 2 fighters/stage, 3 normals) sets it at launch;
+// the dev tools panel's LIGHT page sets it live and logs each change as
+// that value.
+
+struct RoomPreset {
+  const char* name;
+  std::array<float, 3> up, horizon, down; // the sky gradient's colours
+  std::array<float, 3> keyDir, key, fillDir, fill; // directions in the stage's world (y up, z toward the front)
+};
+constexpr std::array<RoomPreset, 3> kRoomPresets{{
+    // An evening room lit by a lamp to the front left: warm, a dim floor.
+    {"LAMP", {0.42f, 0.36f, 0.30f}, {0.36f, 0.30f, 0.24f}, {0.18f, 0.15f, 0.12f},
+     {-0.55f, 0.70f, 0.45f}, {0.70f, 0.52f, 0.34f}, {0.60f, 0.20f, -0.50f}, {0.10f, 0.10f, 0.13f}},
+    // Daylight through a window to the right, low.
+    {"DAY", {0.50f, 0.54f, 0.60f}, {0.44f, 0.46f, 0.48f}, {0.26f, 0.24f, 0.21f},
+     {0.85f, 0.35f, 0.40f}, {0.62f, 0.60f, 0.55f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 0.f}},
+    // Overhead fluorescent light: bright, flat, cool.
+    {"OFFICE", {0.62f, 0.64f, 0.66f}, {0.48f, 0.50f, 0.51f}, {0.28f, 0.28f, 0.28f},
+     {0.10f, 1.00f, 0.25f}, {0.38f, 0.40f, 0.42f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 0.f}},
+}};
+
+struct RoomLight {
+  int source = 0; // 0 off, else 1 + a kRoomPresets index
+  float fighters = 1.f, stage = 1.f, unlit = 0.f, strength = 1.f, yaw = 0.f; // yaw in degrees
+  bool pixel = false;
+  int view = 0;
+};
+
+struct {
+  std::mutex mutex;
+  RoomLight value, defaults;
+  std::array<std::array<float, 3>, 9> sh[kRoomPresets.size()]; // per preset, unscaled (room_sh)
+} g_room;
+
+// The sky gradient's SH L2 irradiance, divided by pi (so a uniform sky of
+// colour c lights a surface c, as a GX ambient does), each coefficient
+// times its basis constant: the shader evaluates the bare polynomials
+// (shader.cpp, xr_room_diffuse), in this order.
+std::array<std::array<float, 3>, 9> room_sh(const RoomPreset& p) {
+  std::array<std::array<double, 3>, 9> acc{};
+  constexpr int kTheta = 64, kPhi = 128;
+  constexpr double kPi = 3.14159265358979323846;
+  for (int i = 0; i < kTheta; ++i) {
+    const double theta = (i + 0.5) * kPi / kTheta; // from up
+    const double y = std::cos(theta), r = std::sin(theta);
+    const double dOmega = r * (kPi / kTheta) * (2.0 * kPi / kPhi);
+    std::array<double, 3> col;
+    for (int c = 0; c < 3; ++c)
+      col[c] = y >= 0.0 ? p.horizon[c] + (p.up[c] - p.horizon[c]) * y : p.horizon[c] + (p.down[c] - p.horizon[c]) * -y;
+    for (int j = 0; j < kPhi; ++j) {
+      const double phi = (j + 0.5) * 2.0 * kPi / kPhi;
+      const double x = r * std::cos(phi), z = r * std::sin(phi);
+      const std::array<double, 9> poly{1.0, y, z, x, x * y, y * z, 3.0 * z * z - 1.0, x * z, x * x - y * y};
+      constexpr std::array<double, 9> basis{0.282095, 0.488603, 0.488603, 0.488603, 1.092548,
+                                            1.092548, 0.315392, 1.092548, 0.546274};
+      for (int k = 0; k < 9; ++k)
+        for (int c = 0; c < 3; ++c)
+          acc[k][c] += col[c] * basis[k] * poly[k] * dOmega;
+    }
+  }
+  // Cosine lobe per band over pi: 1, 2/3, 1/4; and the basis constant again.
+  constexpr std::array<double, 9> lobe{1.0, 2.0 / 3, 2.0 / 3, 2.0 / 3, 0.25, 0.25, 0.25, 0.25, 0.25};
+  constexpr std::array<double, 9> basis{0.282095, 0.488603, 0.488603, 0.488603, 1.092548,
+                                        1.092548, 0.315392, 1.092548, 0.546274};
+  std::array<std::array<float, 3>, 9> out;
+  for (int k = 0; k < 9; ++k)
+    for (int c = 0; c < 3; ++c)
+      out[k][c] = static_cast<float>(acc[k][c] * lobe[k] * basis[k]);
+  return out;
+}
+
+std::string room_light_value(const RoomLight& r) {
+  return fmt::format("{},{:.2f},{:.2f},{:.2f},{:.2f},{:.0f},{},{}", r.source, r.fighters, r.stage, r.unlit, r.strength,
+                     r.yaw, r.pixel ? 1 : 0, r.view);
+}
+
+// The eye pipelines' variant bits (gfx::set_xr_room_light).
+void room_light_apply(const RoomLight& r) {
+  gfx::set_xr_room_light(r.source == 0 ? 0u : 1u | (r.pixel ? 2u : 0u) | (static_cast<uint32_t>(r.view) & 3u) << 2);
+}
+
+void init_room_light() {
+  std::lock_guard lock{g_room.mutex};
+  for (size_t i = 0; i < kRoomPresets.size(); ++i)
+    g_room.sh[i] = room_sh(kRoomPresets[i]);
+  RoomLight r;
+  if (const char* v = std::getenv("AURORA_XR_ROOM_LIGHT")) {
+    float f[8] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f};
+    std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7]);
+    r.source = std::clamp(static_cast<int>(f[0]), 0, static_cast<int>(kRoomPresets.size()));
+    r.fighters = std::clamp(f[1], 0.f, 1.f);
+    r.stage = std::clamp(f[2], 0.f, 1.f);
+    r.unlit = std::clamp(f[3], 0.f, 1.f);
+    r.strength = std::clamp(f[4], 0.f, 2.f);
+    r.yaw = std::fmod(std::fmod(f[5], 360.f) + 360.f, 360.f);
+    r.pixel = f[6] != 0.f;
+    r.view = std::clamp(static_cast<int>(f[7]), 0, 3);
+    Log.info("Room light: AURORA_XR_ROOM_LIGHT={}", room_light_value(r));
+  }
+  g_room.value = g_room.defaults = r;
+  room_light_apply(r);
+}
+
+// What render_eyes puts in the eye uniform's room fields, for a frame.
+struct RoomFrame {
+  bool on = false;
+  float w[4]{}, up[4]{};
+  float sh[9][4]{};
+  std::array<float, 3> dir[2]{}; // in the room
+  float col[2][4]{};
+};
+
+// `arena`: the stage's placement (its rotation about y and scale).
+RoomFrame room_frame(const std::array<float, 16>& arena) {
+  RoomFrame f;
+  RoomLight r;
+  std::array<std::array<float, 3>, 9> sh;
+  {
+    std::lock_guard lock{g_room.mutex};
+    r = g_room.value;
+    if (r.source == 0)
+      return f;
+    sh = g_room.sh[r.source - 1];
+  }
+  const RoomPreset& p = kRoomPresets[r.source - 1];
+  f.on = true;
+  f.w[0] = r.fighters, f.w[1] = r.stage, f.w[2] = r.unlit;
+  for (int k = 0; k < 9; ++k)
+    for (int c = 0; c < 3; ++c)
+      f.sh[k][c] = sh[k][c] * r.strength;
+  // The lights' directions: turned by YAW about the stage's up, then by the
+  // stage's placement into the room.
+  const float yaw = r.yaw * 0.017453292f, cy = std::cos(yaw), sy = std::sin(yaw);
+  const std::array<float, 3>* dirs[2] = {&p.keyDir, &p.fillDir};
+  const std::array<float, 3>* cols[2] = {&p.key, &p.fill};
+  for (int l = 0; l < 2; ++l) {
+    const auto& d = *dirs[l];
+    const float gx = cy * d[0] + sy * d[2], gy = d[1], gz = -sy * d[0] + cy * d[2];
+    std::array<float, 3> v{arena[0] * gx + arena[1] * gy + arena[2] * gz, arena[4] * gx + arena[5] * gy + arena[6] * gz,
+                           arena[8] * gx + arena[9] * gy + arena[10] * gz};
+    const float len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    for (float& c : v)
+      c = len > 1e-12f ? c / len : 0.f;
+    f.dir[l] = v;
+    for (int c = 0; c < 3; ++c)
+      f.col[l][c] = (*cols[l])[c] * r.strength;
+  }
+  // An up-facing surface's light, for unlit draws (as xr_room_diffuse at up).
+  for (int c = 0; c < 3; ++c) {
+    float e = f.sh[0][c] + f.sh[1][c] - f.sh[6][c] - f.sh[8][c];
+    for (int l = 0; l < 2; ++l)
+      e += std::max(f.dir[l][1], 0.f) * f.col[l][c];
+    f.up[c] = std::clamp(e, 0.f, 1.f);
+  }
+  return f;
+}
+
 // ---------------------------------------------------------------- XR thread: the dev tools panel
 //
 // For tuning and A/Bs on the headset (AURORA_XR_DEV_TOOLS=1, a debug aid):
@@ -6038,6 +6210,13 @@ void build_placing_layers(PlacingLayers& out, int mode) {
 // (frequency) and up and down (gain), the last one grabbed taking the Q
 // slider. Reset puts the channel back. Each change is logged as a
 // MELEE_STAGE_MIX value for the whole stage, which the game reads at launch.
+//
+// Light, which the eye shaders apply (room lighting, above): the room's
+// source (off or a preset), the blend toward it for fighters, stage and
+// unlit draws, its strength, the turn of its lights about the stage, the
+// room's part per vertex or per pixel, and a debug view. Reset puts back
+// the launch settings; each change is logged as an AURORA_XR_ROOM_LIGHT
+// value.
 //
 // AURORA_XR_DEV_TOOLS_POS "dx,dy,dz,width" (0.3,-0.15,-0.55,0.36): where it
 // floats against the head, in meters.
@@ -6156,9 +6335,9 @@ constexpr std::array<const char*, kSliders> kSliderNames{"HUE", "TINT", "LIGHT",
 constexpr std::array<float, kSliders> kSliderMax{360.f, 1.f, 1.f, 1.5f};
 
 // The pages, as tabs left of Reset.
-enum { kPageTint, kPageAudio, kPageMix, kPages };
-constexpr std::array<const char*, kPages> kPageNames{"TINT", "AUDIO", "STAGE"};
-constexpr int kTabX0 = 10, kTabW = 150, kTabGap = 10;
+enum { kPageTint, kPageAudio, kPageMix, kPageLight, kPages };
+constexpr std::array<const char*, kPages> kPageNames{"TINT", "AUDIO", "STAGE", "LIGHT"};
+constexpr int kTabX0 = 10, kTabW = 118, kTabGap = 8;
 
 // The Audio page: choices, a row each.
 enum { kSpatial, kMusic, kAudioRows };
@@ -6178,10 +6357,19 @@ constexpr std::array<const char*, AURORA_XR_MIX_BANDS> kBandNames{"LOW", "MID", 
 constexpr std::array<Rgba, AURORA_XR_MIX_BANDS> kBandColors{Rgba{255, 170, 80, 255}, Rgba{120, 220, 140, 255},
                                                             Rgba{190, 150, 255, 255}};
 
+// The Light page (room lighting): a row each, choices or sliders.
+enum { kRlSource, kRlFighters, kRlStage, kRlUnlit, kRlStrength, kRlYaw, kRlShading, kRlView, kRlRows };
+constexpr int kLightRowY0 = 70, kLightRowStep = 50;
+constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE", "FIGHTERS", "STAGE",   "UNLIT",
+                                                       "STRENGTH", "YAW",    "SHADING", "VIEW"};
+constexpr std::array<const char*, 2> kShadingNames{"VERTEX", "PIXEL"};
+constexpr std::array<const char*, 4> kViewNames{"OFF", "LIT", "CLASS", "NORMALS"};
+
 // What's under a laser: a tint slider (kHue..kSat), an Audio row (kAudio +
 // row), a tab (kTab + page), Reset, a Stage channel (kMixChan + channel),
-// its level, its graph or its Q, or -1.
-constexpr int kAudio = 10, kTab = 20, kReset = 30, kMixChan = 40, kMixLevel = 50, kMixGraph = 51, kMixQ = 52;
+// its level, its graph or its Q, a Light row (kLightRow + row), or -1.
+constexpr int kAudio = 10, kTab = 20, kReset = 30, kMixChan = 40, kMixLevel = 50, kMixGraph = 51, kMixQ = 52,
+              kLightRow = 60;
 
 struct DevPanel {
   bool shown = false;
@@ -6547,6 +6735,80 @@ void draw_mix(Canvas& c) {
          fmt::format("{}  {} HZ  {} DB", shape, mix_freq(m.band[band].freq), mix_db(m.band[band].gain)), dim);
 }
 
+// The Light page's rows: a choice's names (none for a slider), a slider's
+// range and its value.
+std::vector<const char*> light_choices(int row) {
+  if (row == kRlSource) {
+    std::vector<const char*> v{"OFF"};
+    for (const auto& p : kRoomPresets)
+      v.push_back(p.name);
+    return v;
+  }
+  if (row == kRlShading)
+    return {kShadingNames.begin(), kShadingNames.end()};
+  if (row == kRlView)
+    return {kViewNames.begin(), kViewNames.end()};
+  return {};
+}
+float light_max(int row) { return row == kRlStrength ? 2.f : row == kRlYaw ? 360.f : 1.f; }
+float& light_slider(RoomLight& r, int row) {
+  return row == kRlFighters ? r.fighters : row == kRlStage ? r.stage : row == kRlUnlit ? r.unlit
+                                         : row == kRlStrength ? r.strength : r.yaw;
+}
+
+void light_log() {
+  RoomLight r;
+  {
+    std::lock_guard lock{g_room.mutex};
+    r = g_room.value;
+  }
+  Log.info("Dev tools: stage 0x{:02X} room light: AURORA_XR_ROOM_LIGHT={}", P.stage, room_light_value(r));
+}
+
+void draw_light(Canvas& c) {
+  const Rgba text{232, 236, 242, 255}, dim{150, 156, 168, 255}, lit{120, 200, 255, 255};
+  RoomLight r;
+  {
+    std::lock_guard lock{g_room.mutex};
+    r = g_room.value;
+  }
+  for (int row = 0; row < kRlRows; ++row) {
+    const int y = kLightRowY0 + row * kLightRowStep;
+    const int target = kLightRow + row;
+    // The rest needs a source.
+    const bool usable = row == kRlSource || r.source != 0;
+    c.text(18, y + 4, 3, kLightNames[row],
+           !usable ? Rgba{90, 94, 104, 255} : target == P.active ? lit : target == P.hover ? text : dim);
+    const auto names = light_choices(row);
+    if (names.empty()) {
+      float& v = light_slider(r, row);
+      const float t = std::clamp(v / light_max(row), 0.f, 1.f);
+      const int kx = kTrackX0 + static_cast<int>(std::lround(t * (kTrackX1 - kTrackX0)));
+      c.fill(kTrackX0, y + 10, kTrackX1, y + kTrackH - 10, {52, 56, 68, 255});
+      c.fill(kTrackX0, y + 10, kx, y + kTrackH - 10, usable ? Rgba{70, 110, 150, 255} : Rgba{60, 64, 74, 255});
+      if (row == kRlStrength) { // 1x
+        const int k1 = kTrackX0 + (kTrackX1 - kTrackX0) / 2;
+        c.fill(k1 - 1, y + 4, k1 + 1, y + kTrackH - 4, {150, 156, 168, 255});
+      }
+      c.fill(kx - 6, y - 7, kx + 6, y + kTrackH + 7, {10, 10, 12, 255});
+      c.fill(kx - 3, y - 4, kx + 3, y + kTrackH + 4, target == P.active ? lit : Rgba{250, 250, 250, 255});
+      c.text(kTrackX1 + 22, y + 4, 3, row == kRlYaw ? fmt::format("{:.0f}", v) : fmt::format("{:.2f}", v), text);
+      continue;
+    }
+    const int n = static_cast<int>(names.size());
+    const int chosen = row == kRlSource ? r.source : row == kRlShading ? (r.pixel ? 1 : 0) : r.view;
+    const int w = (kChoiceX1 - kTrackX0) / n;
+    for (int i = 0; i < n; ++i) {
+      const int x0 = kTrackX0 + i * w;
+      const bool on = i == chosen;
+      c.fill(x0 + 2, y - 4, x0 + w - 2, y + kTrackH + 4,
+             on ? (usable ? Rgba{70, 110, 150, 255} : Rgba{60, 64, 74, 255}) : Rgba{36, 40, 50, 255});
+      const int tw = static_cast<int>(std::strlen(names[i])) * 18 - 3;
+      c.text(x0 + (w - tw) / 2, y + 4, 3, names[i], on ? text : dim);
+    }
+  }
+}
+
 void draw_panel(Canvas& c) {
   c.fill(0, 0, kPanelW, kPanelH, {18, 20, 26, 225});
   c.fill(0, 0, kPanelW, 3, {90, 96, 110, 255});
@@ -6555,6 +6817,8 @@ void draw_panel(Canvas& c) {
     draw_tint(c);
   else if (P.page == kPageAudio)
     draw_audio(c);
+  else if (P.page == kPageLight)
+    draw_light(c);
   else
     draw_mix(c);
 }
@@ -6619,12 +6883,50 @@ int panel_target(float px, float py) {
       return kMixQ;
     return -1;
   }
+  if (P.page == kPageLight) {
+    bool on;
+    {
+      std::lock_guard lock{g_room.mutex};
+      on = g_room.value.source != 0;
+    }
+    for (int row = 0; row < kRlRows; ++row) {
+      const float y = static_cast<float>(kLightRowY0 + row * kLightRowStep);
+      if ((row == kRlSource || on) && px >= kTrackX0 - 24 && px < kChoiceX1 && py >= y - 10 && py < y + kTrackH + 10)
+        return kLightRow + row;
+    }
+    return -1;
+  }
   for (int row = 0; row < kAudioRows; ++row) {
     const float y = static_cast<float>(kAudioRowY0 + row * kAudioRowStep);
     if (px >= kTrackX0 - 24 && px < kChoiceX1 && py >= y - 18 && py < y + kTrackH + 18)
       return kAudio + row;
   }
   return -1;
+}
+
+bool light_is_slider(int target) {
+  return target >= kLightRow && target < kLightRow + kRlRows && light_choices(target - kLightRow).empty();
+}
+
+// A press on a Light choice row at px: picks the segment under it.
+void light_choose(int row, float px) {
+  const int n = static_cast<int>(light_choices(row).size()), w = (kChoiceX1 - kTrackX0) / n;
+  const int i = std::clamp(static_cast<int>((px - kTrackX0) / static_cast<float>(w)), 0, n - 1);
+  RoomLight r;
+  {
+    std::lock_guard lock{g_room.mutex};
+    RoomLight& v = g_room.value;
+    if (row == kRlSource)
+      v.source = i;
+    else if (row == kRlShading)
+      v.pixel = i == 1;
+    else
+      v.view = i;
+    r = v;
+  }
+  room_light_apply(r);
+  P.dirty = true;
+  light_log();
 }
 
 bool panel_holding(const Hand& h) { return h.valid && (h.tracked ? h.held : h.sel); }
@@ -6696,6 +6998,18 @@ void panel_drag(int target, float px, float py) {
     return;
   }
   const float t = std::clamp((px - kTrackX0) / static_cast<float>(kTrackX1 - kTrackX0), 0.f, 1.f);
+  if (light_is_slider(target)) {
+    const int row = target - kLightRow;
+    const float step = row == kRlYaw ? 5.f : 0.05f;
+    const float v = std::round(t * light_max(row) / step) * step;
+    std::lock_guard lock{g_room.mutex};
+    float& slot = light_slider(g_room.value, row);
+    if (v != slot) {
+      slot = v;
+      P.dirty = true;
+    }
+    return;
+  }
   if (target == kAudio + kMusic) {
     const float v = std::round(t * 20.f) / 20.f; // steps of 5%
     std::lock_guard lock{g_devAudio.mutex};
@@ -6718,6 +7032,17 @@ void panel_drag(int target, float px, float py) {
 }
 
 void panel_reset() {
+  if (P.page == kPageLight) {
+    RoomLight r;
+    {
+      std::lock_guard lock{g_room.mutex};
+      r = g_room.value = g_room.defaults;
+    }
+    room_light_apply(r);
+    P.dirty = true;
+    light_log();
+    return;
+  }
   if (P.page == kPageMix) {
     {
       std::lock_guard lock{g_devMix.mutex};
@@ -6754,6 +7079,8 @@ void panel_released() {
     audio_log();
   else if (P.active == kMixLevel || P.active == kMixGraph || P.active == kMixQ)
     mix_log();
+  else if (light_is_slider(P.active))
+    light_log();
 }
 
 // Each display frame, before the arena's grab: shows the panel while `show`,
@@ -6777,8 +7104,10 @@ void update_dev_panel(bool show, bool tintUsable) {
       std::sscanf(v, "%f,%f,%f,%f", &offset.x, &offset.y, &offset.z, &P.width);
     P.pose.position = B.head + rot_y(offset, std::atan2(-fwd.x, -fwd.z));
     P.pose.orientation = facing(P.pose.position, B.head);
-    if (P.page < 0)
-      P.page = tintUsable ? kPageTint : kPageAudio;
+    if (P.page < 0) {
+      std::lock_guard lock{g_room.mutex};
+      P.page = g_room.defaults.source != 0 ? kPageLight : tintUsable ? kPageTint : kPageAudio;
+    }
     P.dirty = true;
     std::lock_guard lock{g_grade.mutex};
     P.stage = g_grade.stage;
@@ -6818,12 +7147,14 @@ void update_dev_panel(bool show, bool tintUsable) {
       P.dirty = true;
     } else if (panel_pressed(hand) && target == kAudio + kSpatial) {
       audio_choose(target - kAudio, px);
+    } else if (panel_pressed(hand) && target >= kLightRow && target < kLightRow + kRlRows && !light_is_slider(target)) {
+      light_choose(target - kLightRow, px);
     } else if (panel_pressed(hand) && target >= kMixChan && target < kMixChan + AURORA_XR_MIX_CHANNELS) {
       P.mixChannel = target - kMixChan;
       P.dirty = true;
     } else if (panel_pressed(hand) &&
                (target == kAudio + kMusic || target == kMixLevel || target == kMixGraph || target == kMixQ ||
-                (target >= 0 && target < kSliders)) &&
+                light_is_slider(target) || (target >= 0 && target < kSliders)) &&
                P.active < 0) {
       if (target == kMixGraph)
         mix_grab(px, py);
@@ -7622,6 +7953,7 @@ bool setup() {
     Log.warn("The stage's shadow unavailable");
   start_surface_worker();
   start_grade_worker();
+  init_room_light();
   if (const char* dir = std::getenv("AURORA_XR_DUMP"); dir != nullptr && *dir != '\0')
     B.dumpDir = dir;
   // Not every exit path calls aurora::shutdown, so stop the XR thread from an
@@ -8155,7 +8487,9 @@ static_assert(gfx::XrMaxClipPlanes == AURORA_XR_MAX_CLIPS && gfx::XrMaxClipPlane
 // Last, for Application SpaceWarp's motion vectors, both eyes' previous
 // frame matrices: for a point fixed in the game world (from this frame's
 // game camera space), then last frame's own (from last frame's).
-constexpr uint64_t kMultiviewEyeSize = 2 * 64 + 16 + gfx::XrMaxClipPlanes * 16 + gfx::XrMaxClipPlanes * 4 + 4 * 64;
+// Then the room light's fields (shader.cpp's XrEye: room_m to room_col).
+constexpr uint64_t kMultiviewEyeSize =
+    2 * 64 + 16 + gfx::XrMaxClipPlanes * 16 + gfx::XrMaxClipPlanes * 4 + 4 * 64 + 64 + 4 * 16 + 9 * 16 + 4 * 16;
 
 struct Renderer3D {
   uint64_t layoutKey = 0;
@@ -9370,6 +9704,14 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
     float clip[gfx::XrMaxClipPlanes][4];
     float fade[gfx::XrMaxClipPlanes]; // bands (game units)
     std::array<Mat4, 2> prev, prevM;
+    // Room lighting (room_frame): game camera space to the room, the
+    // weights (fighters, stage, unlit), an up-facing surface's light, the
+    // key light's direction and half vector in camera space, the SH, the
+    // two lights' directions in the room and their colours.
+    Mat4 roomM;
+    float roomW[4], roomUp[4], roomL[4], roomH[4];
+    float roomSh[9][4];
+    float roomDir[2][4], roomCol[2][4];
   } mv[gfx::XrMaxTransforms]{};
   static_assert(sizeof(mv[0]) == kMultiviewEyeSize);
   std::array<Mat4, gfx::XrMaxTransforms> worldToRoom{}, cameraToRoom{};
@@ -9458,6 +9800,34 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
   }
   Renderer3D::PrevEpoch newEpoch;
   if (g_multiview) {
+    if (const RoomFrame room = room_frame(arena); room.on)
+      for (size_t t = 0; t < transforms; ++t) {
+        auto& u = mv[t];
+        const Mat4& m = cameraToRoom[t];
+        u.roomM = m;
+        std::copy_n(room.w, 4, u.roomW);
+        std::copy_n(room.up, 4, u.roomUp);
+        std::memcpy(u.roomSh, room.sh, sizeof(u.roomSh));
+        std::memcpy(u.roomCol, room.col, sizeof(u.roomCol));
+        for (int l = 0; l < 2; ++l)
+          std::copy_n(room.dir[l].data(), 3, u.roomDir[l]);
+        // The key light into camera space (the transpose of the rotation:
+        // the placement scales evenly), and its half vector with the view
+        // direction (+z, toward the camera), as GX's specular light takes.
+        const auto& d = room.dir[0];
+        float l[3], h[3];
+        for (int c = 0; c < 3; ++c)
+          l[c] = m[0 * 4 + c] * d[0] + m[1 * 4 + c] * d[1] + m[2 * 4 + c] * d[2];
+        const float ll = std::sqrt(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+        for (float& c : l)
+          c = ll > 1e-12f ? c / ll : 0.f;
+        h[0] = l[0], h[1] = l[1], h[2] = l[2] + 1.f;
+        const float hl = std::sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+        for (int c = 0; c < 3; ++c) {
+          u.roomL[c] = l[c];
+          u.roomH[c] = hl > 1e-12f ? h[c] / hl : 0.f;
+        }
+      }
     for (size_t t = 0; t < transforms; ++t)
       webgpu::g_queue.WriteBuffer(R.mvUniforms[t], 0, &mv[t], sizeof(mv[t]));
     newEpoch.worldToRoom = worldToRoom;

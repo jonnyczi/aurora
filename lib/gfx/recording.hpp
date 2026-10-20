@@ -137,6 +137,11 @@ void xr_set_world_clip_more(int pair, const float* planes);
 bool xr_recording_world() noexcept;
 // FIFO thread: a world clip is set (its draws need the clipping pipelines).
 bool xr_soft_clip_active() noexcept;
+// XR room lighting (lib/xr's dev tools), for the eye pipelines: 0 off, else
+// bit 0 on, bit 1 per pixel, bits 2-3 the debug view (ShaderConfig::xrRoom*).
+// Any thread.
+void set_xr_room_light(uint32_t bits) noexcept;
+uint32_t xr_room_light() noexcept;
 // FIFO thread: the current world clip as the eye shaders test it, in game
 // camera space (planes kept where dot >= 0, against vec4(mv_pos, 1)), with
 // each plane's fade band (game units, 0 = hard) and the draw's opacity. Unused

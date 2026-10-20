@@ -1003,19 +1003,47 @@ static XrClipClass classify_xr_clip(const ShaderConfig& config, const u8* raw, u
   return result;
 }
 
+// XR room lighting's class for the current draw, from the game's link
+// markers ("L<n>"): 1 fighters and their items (GX links 5 and 6), 2 the
+// stage (links 0 to 4), 0 anything else (effects, the HUD, unmarked draws).
+// 0 too while the room light is off.
+static u8 xr_room_class() noexcept {
+  if (gfx::xr_room_light() == 0 || sLinkTag == 0)
+    return 0;
+  const u32 link = sLinkTag - 1;
+  return link == 5 || link == 6 ? 1 : link <= 4 ? 2 : 0;
+}
+
+// What the eye config adds to the twins' cache keys (0 with the room light
+// off, so every key stays as it was).
+static uint64_t xr_room_salt() noexcept {
+  const u8 cls = xr_room_class();
+  return cls == 0 ? 0 : (gfx::xr_room_light() << 2 | cls) * 0x9E3779B97F4A7C15ull;
+}
+
 // The eye pipelines' config. AURORA_XR_EYE_NOLIGHT=1 (a measurement, it
 // looks wrong): no GX lighting in the eyes, to see what the vertex stage's
-// lighting costs there (it runs once per eye with multiview).
+// lighting costs there (it runs once per eye with multiview). With the room
+// light on, a fighter or stage draw takes its class and the room's options
+// (ShaderConfig::xrRoom*).
 static const PipelineConfig& xr_eye_config() noexcept {
   static const bool noLight = std::getenv("AURORA_XR_EYE_NOLIGHT") != nullptr;
-  if (!noLight)
+  const u8 cls = xr_room_class();
+  if (!noLight && cls == 0)
     return sDrawCache.config;
   static PipelineConfig c;
   c = sDrawCache.config;
-  for (auto& ch : c.shaderConfig.colorChannels) {
-    ch.lightingEnabled = false;
-    ch.diffFn = GX_DF_NONE;
-    ch.attnFn = GX_AF_NONE;
+  if (noLight)
+    for (auto& ch : c.shaderConfig.colorChannels) {
+      ch.lightingEnabled = false;
+      ch.diffFn = GX_DF_NONE;
+      ch.attnFn = GX_AF_NONE;
+    }
+  if (cls != 0) {
+    const u32 room = gfx::xr_room_light();
+    c.shaderConfig.xrRoom = cls;
+    c.shaderConfig.xrRoomPixel = (room >> 1) & 1;
+    c.shaderConfig.xrRoomView = (room >> 2) & 3;
   }
   return c;
 }
@@ -1025,10 +1053,11 @@ static const PipelineConfig& xr_eye_config() noexcept {
 static gfx::PipelineRef xr_twin(const gfx::RenderTargetLayout& layout, gfx::PipelineRef& ref,
                                 gfx::PipelineRef& forPipeline, uint64_t& forLayout) noexcept {
   auto& cache = sDrawCache;
-  if (forPipeline != cache.pipelineRef || forLayout != layout.key) {
+  const uint64_t key = layout.key ^ xr_room_salt();
+  if (forPipeline != cache.pipelineRef || forLayout != key) {
     ref = gfx::find_pipeline(xr_eye_config(), layout);
     forPipeline = cache.pipelineRef;
-    forLayout = layout.key;
+    forLayout = key;
   }
   return ref;
 }
@@ -1283,10 +1312,11 @@ static gfx::PipelineRef xr_batch_pipeline(bool motion, XrMotionKind kind = XrMot
   auto& ref = motion ? cache.xrMotionBatchRef : cache.xrBatchRef;
   auto& forPipeline = motion ? cache.xrMotionBatchForPipeline : cache.xrBatchForPipeline;
   auto& forLayout = motion ? cache.xrMotionBatchForLayout : cache.xrBatchForLayout;
-  if (forPipeline != cache.pipelineRef || forLayout != layout.key) {
+  const uint64_t key = layout.key ^ (motion ? 0 : xr_room_salt());
+  if (forPipeline != cache.pipelineRef || forLayout != key) {
     ref = gfx::find_pipeline(motion ? xr_motion_twin_config(kind) : xr_eye_config(), layout);
     forPipeline = cache.pipelineRef;
-    forLayout = layout.key;
+    forLayout = key;
   }
   return ref;
 }

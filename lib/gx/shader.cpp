@@ -874,6 +874,59 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
                      alpha ? "a"sv : ""sv);
 }
 
+// XR room lighting (ShaderConfig::xrRoom, multiview eyes only): colour
+// channel i's material colour in the vertex stage, as lighting_func reads it.
+std::string xr_room_mat_src(const ShaderConfig& config, const ColorChannelConfig& cc, u8 i) {
+  return cc.matSrc == GX_SRC_VTX ? vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i))
+                                 : fmt::format("ubuf.cc{}_mat", i);
+}
+
+// The room's version of colour channel i, mixed into `target` (a vec4f
+// holding the game's version, its alpha left alone) by the class's weight
+// (xr.room_w: fighters, stage, unlit, -). `nrm` is the camera-space normal
+// (vec3f(0.0) without one: the room's up stands in), `mat` the material
+// colour. Lit channels take the room's diffuse light, the material times
+// it clamped as GX clamps; specular ones (GX_AF_SPEC) the game's own
+// highlight curve (its first light's cos/dist attenuation) toward the
+// room's key light; unlit ones the room's light on an up-facing surface.
+std::string xr_room_mix(const ShaderConfig& config, const ColorChannelConfig& cc, u8 i, std::string_view target,
+                        std::string_view nrm, std::string_view mat) {
+  const std::string_view weight = !cc.lightingEnabled ? "xr.room_w.z"sv
+                                  : config.xrRoom == 1 ? "xr.room_w.x"sv
+                                                       : "xr.room_w.y"sv;
+  std::string room;
+  if (!cc.lightingEnabled) {
+    room = "xr.room_up.rgb";
+  } else if (cc.attnFn == GX_AF_SPEC) {
+    const std::string_view distAttn = cc.diffFn != GX_DF_NONE
+                                          ? "max(0.0, dot(normalize(light.dist_att), vec3f(1.0, attn, attn * attn)))"sv
+                                          : "max(0.0, dot(light.dist_att, vec3f(1.0, attn, attn * attn)))"sv;
+    const std::string_view diff = cc.diffFn == GX_DF_NONE   ? "1.0"sv
+                                  : cc.diffFn == GX_DF_SIGN ? "dot(xr.room_l.xyz, n)"sv
+                                                            : "max(0.0, dot(xr.room_l.xyz, n))"sv;
+    return fmt::format(R"""(
+    {{
+      let n = {2};
+      var spec = vec3f(0.0);
+      for (var i = 0u; i < {3}u; i++) {{
+          if ((ubuf.lightState{0} & (1u << i)) == 0u) {{ continue; }}
+          let light = ubuf.lights[i];
+          var attn = select(0.0, max(0.0, dot(n, xr.room_h.xyz)), dot(n, xr.room_l.xyz) >= 0.0);
+          let cos_attn = dot(light.cos_att, vec3f(1.0, attn, attn * attn));
+          let dist_attn = {4};
+          attn = max(0.0, cos_attn / dist_attn);
+          spec = attn * {5} * xr.room_col[0].rgb;
+          break;
+      }}
+      {1} = vec4f(mix({1}.rgb, ({6}).rgb * clamp(spec, vec3f(0.0), vec3f(1.0)), {7}), {1}.a);
+    }})""",
+                       i, target, nrm, GX::MaxLights, distAttn, diff, mat, weight);
+  } else {
+    room = fmt::format("xr_room_diffuse({})", nrm);
+  }
+  return fmt::format("\n    {0} = vec4f(mix({0}.rgb, ({1}).rgb * {2}, {3}), {0}.a);", target, mat, room, weight);
+}
+
 absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
 
 #if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
@@ -1425,6 +1478,18 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
     vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.mv_nrm = mv_nrm;";
   }
+  // XR room lighting (multiview eyes): the camera-space normal the room term
+  // reads, in the vertex stage and, per pixel or for the normals view, the
+  // fragment stage (none without normals: the room's up stands in).
+  const bool xrRoom = viewCount > 1 && config.xrRoom != 0;
+  const bool xrRoomHasNrm = config.attrs[GX_VA_NRM].attrType != GX_NONE;
+  const std::string_view xrRoomNrm = xrRoomHasNrm ? "mv_nrm"sv : "vec3f(0.0)"sv;
+  const bool xrRoomNrmOut = xrRoom && xrRoomHasNrm && (config.xrRoomPixel || config.xrRoomView == 3);
+  const std::string_view xrRoomNrmPx = xrRoomNrmOut ? "xr_n"sv : "vec3f(0.0)"sv;
+  if (xrRoomNrmOut) {
+    vtxOutAttrs += fmt::format("\n    @location({}) xr_n: vec3f,", vtxOutIdx++);
+    vtxXfrAttrsPre += "\n    out.xr_n = mv_nrm;";
+  }
 
   uniBufAttrs += "\n    proj: mat4x4f,";
   uniBufAttrs += fmt::format("\n    postex_mtx: array<mat3x4f, {}>,", MaxPnMtx + MaxTexMtx);
@@ -1520,6 +1585,9 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
     }
   }
 
+  if (xrRoomNrmOut) {
+    fragmentFnPre += "\n    let xr_n = select(vec3f(0.0), normalize(in.xr_n), dot(in.xr_n, in.xr_n) > 1e-12);";
+  }
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (!info.sampledColorChannels.test(i)) {
       continue;
@@ -1558,6 +1626,17 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
       vtxXfrAttrs += lighting_func(config, cc, i, false);
       vtxXfrAttrs += lighting_func(config, cca, i, true);
       fragmentFnPre += fmt::format("\n    var rast{0} = in.cc{0};", i);
+      // XR room lighting: the room's version mixed in, per vertex or (the
+      // material colour carried along) per pixel.
+      if (xrRoom && !config.xrRoomPixel) {
+        vtxXfrAttrs += xr_room_mix(config, cc, i, fmt::format("out.cc{}", i), xrRoomNrm,
+                                   xr_room_mat_src(config, cc, i));
+      } else if (xrRoom) {
+        vtxOutAttrs += fmt::format("\n    @location({}) xr_mat{}: vec4f,", vtxOutIdx++, i);
+        vtxXfrAttrs += fmt::format("\n    out.xr_mat{} = {};", i, xr_room_mat_src(config, cc, i));
+        fragmentFnPre += xr_room_mix(config, cc, i, fmt::format("rast{}", i), xrRoomNrmPx,
+                                     fmt::format("in.xr_mat{}", i));
+      }
     }
   }
   for (int i = 0; i < info.sampledKColors.size(); ++i) {
@@ -2086,6 +2165,20 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
     }
     fragReturn += "\n    return out_frag;";
   }
+  // XR room lighting's debug views, over the final colour: lit draws green
+  // and unlit ones magenta; fighters blue and the stage orange; the normal
+  // in room space (grey without one).
+  if (xrRoom && config.xrRoomView == 1) {
+    fragReturn.insert(0, fmt::format("\n    prev = vec4f(mix(prev.rgb, vec3f({}), 0.65), prev.a);",
+                                     info.lightingEnabled ? "0.2, 1.0, 0.3" : "1.0, 0.2, 0.9"));
+  } else if (xrRoom && config.xrRoomView == 2) {
+    fragReturn.insert(0, fmt::format("\n    prev = vec4f(mix(prev.rgb, vec3f({}), 0.65), prev.a);",
+                                     config.xrRoom == 1 ? "0.3, 0.6, 1.0" : "1.0, 0.6, 0.2"));
+  } else if (xrRoom && config.xrRoomView == 3) {
+    fragReturn.insert(0, xrRoomNrmOut ? "\n    prev = vec4f(select(vec3f(0.5), xr_room_n(xr_n) * 0.5 + 0.5, "
+                                        "dot(xr_n, xr_n) > 0.0), prev.a);"
+                                      : "\n    prev = vec4f(vec3f(0.5), prev.a);");
+  }
 
   /* Byte/half-word unpacking has no form every mobile compiler accepts:
    * PowerVR Rogue miscompiles extractBits on storage-buffer reads (vertex
@@ -2485,7 +2578,9 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
     const std::string anchor = "var<uniform> ubuf: Uniform;";
     if (auto at = shaderSource.find(anchor); at != std::string::npos) {
       shaderSource.insert(at + anchor.size(),
-                          multiview ? fmt::format("\nstruct XrEye {{ m: array<mat4x4f, {0}>, enabled: vec4u, clip: array<vec4f, 8>, fade: array<vec4f, 2>, prev: array<mat4x4f, {0}>, prev_m: array<mat4x4f, {0}> }};"
+                          multiview ? fmt::format("\nstruct XrEye {{ m: array<mat4x4f, {0}>, enabled: vec4u, clip: array<vec4f, 8>, fade: array<vec4f, 2>, prev: array<mat4x4f, {0}>, prev_m: array<mat4x4f, {0}>,"
+                                                  " room_m: mat4x4f, room_w: vec4f, room_up: vec4f, room_l: vec4f, room_h: vec4f,"
+                                                  " room_sh: array<vec4f, 9>, room_dir: array<vec4f, 2>, room_col: array<vec4f, 2> }};"
                                                   "\n@group(3) @binding(0)\nvar<uniform> xr: XrEye;"
                                                   "\nvar<private> xr_view: u32;"
                                                   "\nvar<private> xr_cam: vec3f;"
@@ -2501,6 +2596,31 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
                                                   "\n    if (xr.enabled.x != 0u) { return vec4f(p, 1.0) * xr.m; }"
                                                   "\n    return vec4f(p, 1.0) * ubuf.proj;"
                                                   "\n}"));
+    }
+    // XR room lighting (lib/xr fills the room_* fields): a camera-space
+    // normal into the room, and the room's diffuse light on it (SH L2
+    // irradiance, its coefficients premultiplied by the basis and cosine
+    // lobe constants, plus two directional lights), clamped as GX clamps.
+    if (const auto at = shaderSource.find("struct VertexOutput {");
+        multiview && config.xrRoom != 0 && at != std::string::npos) {
+      shaderSource.insert(at, R"""(
+fn xr_room_n(n_cam: vec3f) -> vec3f {
+    let r = (vec4f(n_cam, 0.0) * xr.room_m).xyz;
+    return select(vec3f(0.0, 1.0, 0.0), normalize(r), dot(r, r) > 1e-12);
+}
+
+fn xr_room_diffuse(n_cam: vec3f) -> vec3f {
+    let n = xr_room_n(n_cam);
+    var e = xr.room_sh[0].rgb + xr.room_sh[1].rgb * n.y + xr.room_sh[2].rgb * n.z + xr.room_sh[3].rgb * n.x
+        + xr.room_sh[4].rgb * (n.x * n.y) + xr.room_sh[5].rgb * (n.y * n.z)
+        + xr.room_sh[6].rgb * (3.0 * n.z * n.z - 1.0) + xr.room_sh[7].rgb * (n.x * n.z)
+        + xr.room_sh[8].rgb * (n.x * n.x - n.y * n.y);
+    e += max(dot(n, xr.room_dir[0].xyz), 0.0) * xr.room_col[0].rgb;
+    e += max(dot(n, xr.room_dir[1].xyz), 0.0) * xr.room_col[1].rgb;
+    return clamp(e, vec3f(0.0), vec3f(1.0));
+}
+
+)""");
     }
     if (multiview) {
       shaderSource.insert(0, "enable chromium_experimental_multiview;\n");
