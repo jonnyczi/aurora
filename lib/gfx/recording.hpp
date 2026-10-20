@@ -138,7 +138,8 @@ bool xr_recording_world() noexcept;
 // FIFO thread: a world clip is set (its draws need the clipping pipelines).
 bool xr_soft_clip_active() noexcept;
 // XR room lighting (lib/xr's dev tools), for the eye pipelines: 0 off, else
-// bit 0 on, bit 1 per pixel, bits 2-3 the debug view (ShaderConfig::xrRoom*).
+// bit 0 on, bit 1 per pixel, bits 2-3 the debug view, bit 4 facet normals
+// (ShaderConfig::xrRoom*).
 // Any thread.
 void set_xr_room_light(uint32_t bits) noexcept;
 uint32_t xr_room_light() noexcept;

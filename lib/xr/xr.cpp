@@ -6023,11 +6023,15 @@ void build_placing_layers(PlacingLayers& out, int mode) {
 // the room is one of a few presets: a sky gradient (up, horizon, down) in
 // SH L2, and a key and a fill light set against the stage (they turn with
 // it; YAW turns them about its up axis). Lighting is per vertex, as GX's
-// is, or per pixel for the room's part (a comparison, and its cost).
+// is, or per pixel for the room's part (a comparison, and its cost), or per
+// pixel with facet normals: the stage's unlit draws, which have no normals,
+// lit by the room as their triangles face (a flat-shaded relight of baked
+// stages).
 //
-// AURORA_XR_ROOM_LIGHT "source,fighters,stage,unlit,strength,yaw,pixel,view"
-// (any leading part; source 0 off, 1 lamp, 2 day, 3 office; pixel 0 or 1;
-// view 0 off, 1 lit/unlit, 2 fighters/stage, 3 normals) sets it at launch;
+// AURORA_XR_ROOM_LIGHT "source,fighters,stage,unlit,strength,yaw,shading,view"
+// (any leading part; source 0 off, 1 lamp, 2 day, 3 office; shading 0 per
+// vertex, 1 per pixel, 2 facet; view 0 off, 1 lit/unlit, 2 fighters/stage,
+// 3 normals) sets it at launch;
 // the dev tools panel's LIGHT page sets it live and logs each change as
 // that value.
 
@@ -6051,7 +6055,7 @@ constexpr std::array<RoomPreset, 3> kRoomPresets{{
 struct RoomLight {
   int source = 0; // 0 off, else 1 + a kRoomPresets index
   float fighters = 1.f, stage = 1.f, unlit = 0.f, strength = 1.f, yaw = 0.f; // yaw in degrees
-  bool pixel = false;
+  int shading = 0; // 0 per vertex, 1 per pixel, 2 per pixel with facet normals where meshes have none
   int view = 0;
 };
 
@@ -6100,12 +6104,14 @@ std::array<std::array<float, 3>, 9> room_sh(const RoomPreset& p) {
 
 std::string room_light_value(const RoomLight& r) {
   return fmt::format("{},{:.2f},{:.2f},{:.2f},{:.2f},{:.0f},{},{}", r.source, r.fighters, r.stage, r.unlit, r.strength,
-                     r.yaw, r.pixel ? 1 : 0, r.view);
+                     r.yaw, r.shading, r.view);
 }
 
 // The eye pipelines' variant bits (gfx::set_xr_room_light).
 void room_light_apply(const RoomLight& r) {
-  gfx::set_xr_room_light(r.source == 0 ? 0u : 1u | (r.pixel ? 2u : 0u) | (static_cast<uint32_t>(r.view) & 3u) << 2);
+  gfx::set_xr_room_light(r.source == 0 ? 0u
+                                         : 1u | (r.shading == 1 ? 2u : 0u) | (static_cast<uint32_t>(r.view) & 3u) << 2 |
+                                               (r.shading == 2 ? 16u : 0u));
 }
 
 void init_room_light() {
@@ -6122,7 +6128,7 @@ void init_room_light() {
     r.unlit = std::clamp(f[3], 0.f, 1.f);
     r.strength = std::clamp(f[4], 0.f, 2.f);
     r.yaw = std::fmod(std::fmod(f[5], 360.f) + 360.f, 360.f);
-    r.pixel = f[6] != 0.f;
+    r.shading = std::clamp(static_cast<int>(f[6]), 0, 2);
     r.view = std::clamp(static_cast<int>(f[7]), 0, 3);
     Log.info("Room light: AURORA_XR_ROOM_LIGHT={}", room_light_value(r));
   }
@@ -6362,7 +6368,7 @@ enum { kRlSource, kRlFighters, kRlStage, kRlUnlit, kRlStrength, kRlYaw, kRlShadi
 constexpr int kLightRowY0 = 70, kLightRowStep = 50;
 constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE", "FIGHTERS", "STAGE",   "UNLIT",
                                                        "STRENGTH", "YAW",    "SHADING", "VIEW"};
-constexpr std::array<const char*, 2> kShadingNames{"VERTEX", "PIXEL"};
+constexpr std::array<const char*, 3> kShadingNames{"VERTEX", "PIXEL", "FACET"};
 constexpr std::array<const char*, 4> kViewNames{"OFF", "LIT", "CLASS", "NORMALS"};
 
 // What's under a laser: a tint slider (kHue..kSat), an Audio row (kAudio +
@@ -6796,7 +6802,7 @@ void draw_light(Canvas& c) {
       continue;
     }
     const int n = static_cast<int>(names.size());
-    const int chosen = row == kRlSource ? r.source : row == kRlShading ? (r.pixel ? 1 : 0) : r.view;
+    const int chosen = row == kRlSource ? r.source : row == kRlShading ? r.shading : r.view;
     const int w = (kChoiceX1 - kTrackX0) / n;
     for (int i = 0; i < n; ++i) {
       const int x0 = kTrackX0 + i * w;
@@ -6919,7 +6925,7 @@ void light_choose(int row, float px) {
     if (row == kRlSource)
       v.source = i;
     else if (row == kRlShading)
-      v.pixel = i == 1;
+      v.shading = i;
     else
       v.view = i;
     r = v;

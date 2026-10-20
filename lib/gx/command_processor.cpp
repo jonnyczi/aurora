@@ -1014,6 +1014,59 @@ static u8 xr_room_class() noexcept {
   return link == 5 || link == 6 ? 1 : link <= 4 ? 2 : 0;
 }
 
+// AURORA_XR_ROOM_CENSUS=1 (a survey, with or without the room light): how
+// the stage's world draws get their colour, by vertices: lit or not, with normals or not, and for the
+// unlit ones where any baked light would be: vertex colours the TEV reads
+// (the material from the vertex), a constant colour, or textures alone;
+// additive draws (glows) apart. Every 5000 of them.
+static void xr_room_census(u16 vtxCount) noexcept {
+  static const bool on = std::getenv("AURORA_XR_ROOM_CENSUS") != nullptr;
+  if (!on || sLinkTag == 0 || sLinkTag - 1 > 4)
+    return;
+  const auto& c = sDrawCache.config;
+  const auto& sc = c.shaderConfig;
+  bool ras = false, tex = false;
+  for (u32 i = 0; i < sc.tevStageCount; ++i) {
+    const auto& st = sc.tevStages[i];
+    for (const auto arg : {st.colorPass.a, st.colorPass.b, st.colorPass.c, st.colorPass.d})
+      ras |= arg == GX_CC_RASC || arg == GX_CC_RASA;
+    tex |= st.texMapId != GX_TEXMAP_NULL;
+  }
+  const auto& cc = sc.colorChannels[0];
+  const bool additive = c.blendMode == GX_BM_BLEND && c.blendFacDst == GX_BL_ONE;
+  const bool nrm = sc.attrs[GX_VA_NRM].attrType != GX_NONE;
+  const bool vtxClr = cc.matSrc == GX_SRC_VTX && sc.attrs[GX_VA_CLR0].attrType != GX_NONE;
+  enum { Additive, LitNrm, LitNoNrm, UnlitVtx, UnlitConst, UnlitTex, Other, Kinds };
+  const int kind = additive             ? Additive
+                   : cc.lightingEnabled ? (nrm ? LitNrm : LitNoNrm)
+                   : ras && vtxClr      ? UnlitVtx
+                   : ras                ? UnlitConst
+                   : tex                ? UnlitTex
+                                        : Other;
+  static std::array<u64, Kinds> verts{}, draws{};
+  static std::array<u64, Kinds> nrms{};
+  static u32 n = 0;
+  verts[kind] += vtxCount;
+  ++draws[kind];
+  nrms[kind] += nrm ? vtxCount : 0;
+  if (++n % 5000 != 0)
+    return;
+  u64 total = 0;
+  for (const u64 v : verts)
+    total += v;
+  constexpr std::array<const char*, Kinds> names{"additive", "lit, normals", "lit, no normals",
+                                                 "unlit, vertex colours", "unlit, constant colour",
+                                                 "unlit, textures only", "other"};
+  std::string line;
+  for (int k = 0; k < Kinds; ++k)
+    if (verts[k] != 0)
+      line += fmt::format(" {} {:.0f}% ({} draws{});", names[k], 100.0 * verts[k] / std::max<u64>(total, 1), draws[k],
+                          nrms[k] != 0 && k > LitNoNrm ? fmt::format(", {:.0f}% with normals", 100.0 * nrms[k] / verts[k])
+                                                       : std::string{});
+  Log.info("XR room census: stage draws by vertices:{}", line);
+  verts = {}, draws = {}, nrms = {};
+}
+
 // What the eye config adds to the twins' cache keys (0 with the room light
 // off, so every key stays as it was).
 static uint64_t xr_room_salt() noexcept {
@@ -1042,7 +1095,8 @@ static const PipelineConfig& xr_eye_config() noexcept {
   if (cls != 0) {
     const u32 room = gfx::xr_room_light();
     c.shaderConfig.xrRoom = cls;
-    c.shaderConfig.xrRoomPixel = (room >> 1) & 1;
+    c.shaderConfig.xrRoomFacet = (room >> 4) & 1;
+    c.shaderConfig.xrRoomPixel = ((room >> 1) & 1) | c.shaderConfig.xrRoomFacet;
     c.shaderConfig.xrRoomView = (room >> 2) & 3;
   }
   return c;
@@ -1644,6 +1698,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     XrClipClass cls;
     bool masked;
     xrPipeline = xr_world_pipeline(raw, vtxCount, &cls, outside.data(), &masked, unsolid.data());
+    if (gfx::xr_recording_world())
+      xr_room_census(vtxCount);
     cls_inside = cls == XrClipClass::Inside;
     if (xrPipeline != 0 && cls != XrClipClass::Outside &&
         (xrMotionPipeline = xr_motion_pipeline(xrMotionKind, cls == XrClipClass::Straddle)) != 0)

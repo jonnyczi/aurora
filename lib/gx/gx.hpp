@@ -531,13 +531,15 @@ struct ShaderConfig {
   u8 decodedAll : 1 = 0;
   /* XR room lighting (eye draws only; lib/xr's dev tools): the draw's class,
    * 0 none, 1 fighters (GX links 5 and 6), 2 the stage (links 0 to 4); the
-   * room term per pixel instead of per vertex; and a debug view (0 none,
-   * 1 lit or unlit, 2 the class, 3 the room-space normal). Spare pad bits:
-   * sizeof is unchanged, and 0 is every config as it was. */
+   * room term per pixel instead of per vertex; with that, facet normals
+   * (screen-space derivatives) where the mesh has none, lighting unlit
+   * draws by them; and a debug view (0 none, 1 lit or unlit, 2 the class,
+   * 3 the room-space normal). The last pad bits: sizeof is unchanged, and 0
+   * is every config as it was. */
   u8 xrRoom : 2 = 0;
   u8 xrRoomPixel : 1 = 0;
   u8 xrRoomView : 2 = 0;
-  u8 pad2 : 1 = 0;
+  u8 xrRoomFacet : 1 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
   std::array<TevStage, MaxTevStages> tevStages;
