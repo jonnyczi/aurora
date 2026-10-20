@@ -144,6 +144,26 @@ void aurora_xr_set_stage_top(float y);
  * arena). aurora_xr_set_stage clears it. Any thread. */
 void aurora_xr_set_stage_footprint(float xmin, float xmax, float zmin, float zmax, float ybottom);
 
+/* Room capture, for XR room lighting (the dev tools' Light page, source
+ * ROOM): the platform streams a passthrough camera while one runs, and
+ * hands in each frame reduced to a grid of mean colour; the room's light
+ * is made from them by where the head looked.
+ *
+ * Polled by the platform's capture thread a few times a second: 1 while a
+ * capture runs, 0 when none. Any thread. */
+int aurora_xr_room_capture_wanted(void);
+/* The camera, once per capture: its lens pose (Camera2 LENS_POSE_ROTATION
+ * x, y, z, w and LENS_POSE_TRANSLATION, metres, against the head), its
+ * intrinsics (fx, fy, cx, cy in sensor pixels), the sensor's size those are
+ * in, and the size of the frames streamed (scaled from the whole sensor).
+ * Any thread. */
+void aurora_xr_room_capture_camera(const float rotation[4], const float translation[3], const float intrinsics[4],
+                                   int sensor_width, int sensor_height, int width, int height);
+/* A frame: cols x rows cells of mean linear RGB (row-major from the top
+ * left, 3 floats each), with its exposure (ms) and sensitivity (ISO);
+ * unknown ones negative. Any thread. */
+void aurora_xr_room_capture_frame(const float* rgb, int cols, int rows, float exposure_ms, float iso);
+
 /* The room's colour grade for the current stage's fights in mixed reality:
  * passthrough tinted toward the stage's palette, a gain per channel (linear
  * light) and a saturation; 1, 1, 1, 1 is none. It fades in as a fight starts
