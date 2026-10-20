@@ -4584,6 +4584,39 @@ RoomSurvey room_finish(const RoomSamples& rs, const XrPosef& head, XrTime time) 
   return out;
 }
 
+// Room capture's (below): whether one is running, and a depth hit along a
+// ray from the head while it does.
+bool capture_casting();
+void capture_note_hit(const XrVector3f& origin, const XrVector3f& point);
+
+// While a room capture runs: a grid of rays across the view (5 across, 4
+// down, within 25 and 18 degrees of its middle), each hit noted by its
+// direction from the head, so the capture's lights get a place in the room
+// as well as a direction (a lamp or window seen straight on, which a
+// capture asks for).
+void light_cast(SurfaceWorker& w, const XrPosef& head, XrTime time) {
+  XrEnvironmentRaycastFilterDistanceMETA reach{XR_TYPE_ENVIRONMENT_RAYCAST_FILTER_DISTANCE_META};
+  reach.maxDistance = kRoomReach;
+  const XrEnvironmentRaycastFilterBaseHeaderMETA* filters[] = {
+      reinterpret_cast<const XrEnvironmentRaycastFilterBaseHeaderMETA*>(&reach)};
+  for (const float x : {-0.47f, -0.23f, 0.f, 0.23f, 0.47f})
+    for (const float y : {-0.32f, -0.11f, 0.11f, 0.32f}) {
+      const float n = std::sqrt(x * x + y * y + 1.f);
+      XrEnvironmentRaycastHitGetInfoMETA gi{XR_TYPE_ENVIRONMENT_RAYCAST_HIT_GET_INFO_META};
+      gi.baseSpace = B.space;
+      gi.time = time;
+      gi.origin = head.position;
+      gi.direction = qrot(head.orientation, {x / n, y / n, -1.f / n});
+      gi.filterCount = 1;
+      gi.filters = filters;
+      XrEnvironmentRaycastHitMETA hit{XR_TYPE_ENVIRONMENT_RAYCAST_HIT_META};
+      if (XR_SUCCEEDED(B.performRaycast(w.raycaster, &gi, &hit)) &&
+          (hit.status == XR_ENVIRONMENT_RAYCAST_HIT_STATUS_HIT_META ||
+           hit.status == XR_ENVIRONMENT_RAYCAST_HIT_STATUS_HIT_INVALID_ORIENTATION_META))
+        capture_note_hit(head.position, hit.pose.position);
+    }
+}
+
 void surface_main() {
   using State = SurfaceEstimate::State;
   SurfaceWorker w;
@@ -4602,7 +4635,7 @@ void surface_main() {
       // 15 casts a second while casting, the raycaster's future polled every
       // 50 ms while it's created; otherwise asleep until asked (waking each
       // second to let an idle raycaster go).
-      const bool surveyDue = g_surface.surveyWanted && !g_surface.survey.done;
+      const bool surveyDue = (g_surface.surveyWanted && !g_surface.survey.done) || capture_casting();
       if (!g_surface.stop && !g_surface.reset)
         g_surface.cv.wait_for(lock, w.caster == Caster::Creating ? std::chrono::milliseconds(50)
                                     : w.active || surveyDue      ? std::chrono::milliseconds(66)
@@ -4645,6 +4678,14 @@ void surface_main() {
         const RoomSurvey r = room_finish(rs, head, time);
         std::lock_guard lock{g_surface.mutex};
         g_surface.survey = r;
+      }
+    }
+    if (capture_casting() && headValid && time != 0 && B.envRaycast &&
+        (w.caster == Caster::Off || w.caster == Caster::Creating || w.caster == Caster::Ready)) {
+      raycaster_step(w);
+      if (w.caster == Caster::Ready) {
+        light_cast(w, head, time);
+        w.lastCastNs = now;
       }
     }
     const bool active = placing || now < burstUntil;
@@ -6097,10 +6138,11 @@ struct {
 constexpr int kCapN = 8;
 constexpr int kCapCells = 6 * kCapN * kCapN;
 constexpr int64_t kCaptureNs = 20'000'000'000;
-// The level per unit of passthrough brightness: PROVISIONAL (T4 found the
-// camera's mean linear luminance about 0.16 in a room the stage looked
-// right in, and the user matched one at 0.75), to be set from a capture's
-// log in a room the user matched; and the fighters' mean light at level 1.
+// The level per unit of passthrough brightness (T4 found the camera's mean
+// linear luminance about 0.16 in a room the stage looked right in, and the
+// user had matched one at 0.75): confirmed on the headset, a capture there
+// measured 0.147, a level of 0.74, and STRENGTH 1 looked right. And the
+// fighters' mean light at level 1.
 constexpr float kCapDisplay = 5.f;
 constexpr float kCapFighters = 0.7f;
 constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
@@ -6118,6 +6160,10 @@ struct {
   uint32_t frames = 0, sinceMade = 0;
   float exposure = -1.f, iso = -1.f;
   std::vector<float> factors; // each frame's exposure (ms) times ISO over 100
+  // Depth hits (light_cast) by their direction from the head: x, y, z sums, count.
+  std::array<std::array<double, 4>, kCapCells> hits{};
+  std::array<bool, 2> lightAt{};                 // a light with a place in the room
+  std::array<std::array<float, 3>, 2> lightPos{}; // where
   float mean = 1.f, display = 0.f, level = 1.f; // mean light (up 1), passthrough's up, level
   // The light last made from them (made: any).
   bool made = false;
@@ -6283,6 +6329,16 @@ void capture_make() {
     for (int ch = 0; ch < 3; ++ch)
       c.light[l][ch] = static_cast<float>(light[l][ch] * scale);
   c.lightDir = lightDir;
+  // Where the lights are, from the depth hits in their cells (none: at a
+  // distance, as daylight through a window, whose glass depth doesn't see).
+  for (int l = 0; l < 2; ++l) {
+    c.lightAt[l] = false;
+    if (picked[l] < 0 || c.hits[picked[l]][3] < 2.0)
+      continue;
+    const auto& h = c.hits[picked[l]];
+    c.lightPos[l] = {static_cast<float>(h[0] / h[3]), static_cast<float>(h[1] / h[3]), static_cast<float>(h[2] / h[3])};
+    c.lightAt[l] = true;
+  }
   c.coverage = static_cast<float>(seenN) / kCapCells;
   c.made = true;
 }
@@ -6297,16 +6353,43 @@ void capture_start() {
   g_capture.made = false;
   g_capture.coverage = 0.f;
   g_capture.factors.clear();
+  g_capture.hits = {};
+  g_capture.lightAt = {};
+}
+
+bool capture_casting() {
+  std::lock_guard lock{g_capture.mutex};
+  return g_capture.requested && g_capture.untilNs != 0;
+}
+
+void capture_note_hit(const XrVector3f& origin, const XrVector3f& point) {
+  const int cell = cap_cell({point.x - origin.x, point.y - origin.y, point.z - origin.z});
+  if (cell < 0)
+    return;
+  std::lock_guard lock{g_capture.mutex};
+  auto& h = g_capture.hits[cell];
+  h[0] += point.x, h[1] += point.y, h[2] += point.z, h[3] += 1.0;
 }
 
 // The captured light for room_frame: false while none is made.
 bool capture_light(std::array<std::array<float, 3>, 9>& sh, std::array<std::array<float, 3>, 2>& dirs,
-                   std::array<std::array<float, 3>, 2>& lights, float& mean, float& level) {
+                   std::array<std::array<float, 3>, 2>& lights, float& mean, float& level,
+                   const XrVector3f& stage) {
   std::lock_guard lock{g_capture.mutex};
   if (!g_capture.made)
     return false;
   sh = g_capture.sh;
   dirs = g_capture.lightDir;
+  // A light with a place: toward it from the stage, wherever the stage is.
+  for (int l = 0; l < 2; ++l) {
+    if (!g_capture.lightAt[l])
+      continue;
+    const auto& p = g_capture.lightPos[l];
+    const float d[3] = {p[0] - stage.x, p[1] - stage.y, p[2] - stage.z};
+    const float n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (n > 0.05f)
+      dirs[l] = {d[0] / n, d[1] / n, d[2] / n};
+  }
   lights = g_capture.light;
   mean = g_capture.mean;
   level = g_capture.level;
@@ -6449,7 +6532,7 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   std::array<std::array<float, 3>, 2> capDirs, capLights;
   float capMean = 1.f, capLevel = 1.f;
   const bool captured = r.source == kRoomSourceCaptured;
-  if (captured && !capture_light(sh, capDirs, capLights, capMean, capLevel))
+  if (captured && !capture_light(sh, capDirs, capLights, capMean, capLevel, arena_pose().pos))
     return f;
   // The captured room's level (ABL, by STRENGTH), and the fighters' scale:
   // the room's mean light to kCapFighters times it.
@@ -10920,11 +11003,16 @@ extern "C" int aurora_xr_room_capture_wanted(void) {
     c.requested = false;
     capture_make();
     Log.info("Room capture: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
-             "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f}; passthrough's up {:.4f}, level {:.2f}; "
+             "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} (placed: {}, {}); passthrough's up {:.4f}, level {:.2f}; "
              "brightest cells (room x,y,z; times the mean):{}",
              c.frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
              c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
-             c.lightDir[1][1], c.lightDir[1][2], c.display, c.level, capture_brightest());
+             c.lightDir[1][1], c.lightDir[1][2],
+             c.lightAt[0] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[0][0], c.lightPos[0][1], c.lightPos[0][2])
+                          : "no",
+             c.lightAt[1] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[1][0], c.lightPos[1][1], c.lightPos[1][2])
+                          : "no",
+             c.display, c.level, capture_brightest());
     return 0;
   }
   return 1;
