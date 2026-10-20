@@ -1483,7 +1483,9 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
   // reads, in the vertex stage and, per pixel or for the normals view, the
   // fragment stage (none without normals: the room's up stands in). Facet
   // normals: without the mesh's own, the triangle's from the screen-space
-  // derivatives of its camera-space position, turned toward the camera.
+  // derivatives of its camera-space position. Their order alone turns it
+  // toward this eye (screen y runs down); a test against the game camera's
+  // origin flips surfaces whose plane runs between that camera and the eye.
   const bool xrRoom = viewCount > 1 && config.xrRoom != 0;
   const bool xrRoomHasNrm = config.attrs[GX_VA_NRM].attrType != GX_NONE;
   const std::string_view xrRoomNrm = xrRoomHasNrm ? "mv_nrm"sv : "vec3f(0.0)"sv;
@@ -1596,9 +1598,8 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
   if (xrRoomNrmOut) {
     fragmentFnPre += "\n    let xr_n = select(vec3f(0.0), normalize(in.xr_n), dot(in.xr_n, in.xr_n) > 1e-12);";
   } else if (xrRoomFacetNrm) {
-    fragmentFnPre += "\n    let xr_f = cross(dpdx(in.xr_p), dpdy(in.xr_p));"
-                     "\n    let xr_fn = select(vec3f(0.0), normalize(xr_f), dot(xr_f, xr_f) > 1e-30);"
-                     "\n    let xr_n = select(xr_fn, -xr_fn, dot(xr_fn, in.xr_p) > 0.0);";
+    fragmentFnPre += "\n    let xr_f = cross(dpdy(in.xr_p), dpdx(in.xr_p));"
+                     "\n    let xr_n = select(vec3f(0.0), normalize(xr_f), dot(xr_f, xr_f) > 1e-30);";
   }
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (!info.sampledColorChannels.test(i)) {
