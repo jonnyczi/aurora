@@ -1655,7 +1655,7 @@ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLa
     return runtimeKey;
   // XR room lighting's variants (a dev tool) aren't kept for prewarming the
   // next launch: a session trying its views would leave hundreds to build.
-  remember_pipeline_config(ShaderType::GX, config, current_frame(), config.shaderConfig.xrRoom == 0);
+  remember_pipeline_config(ShaderType::GX, config, current_frame(), config.shaderConfig.xrRoom == 0 && config.shaderConfig.xrSmoothNrm == 0);
   const PipelineRef ref = resolve_pipeline(ShaderType::GX, config, layout,
                                            g_pipelineSync ? PipelinePriority::Blocking : PipelinePriority::Normal);
   {

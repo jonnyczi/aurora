@@ -543,7 +543,14 @@ struct ShaderConfig {
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
   std::array<TevStage, MaxTevStages> tevStages;
-  u32 tevStageCount = 0;
+  u32 tevStageCount : 8 = 0;
+  /* XR room lighting's SMOOTH shading: a stage draw without normals whose
+   * decoded vertex (decodedAll) carries smooth ones the CPU worked out
+   * (kDecodedXrNrm). In the game's config too, as the vertex buffer is
+   * shared. Bits of tevStageCount's word: sizeof is unchanged, and 0 is
+   * every config as it was. */
+  u32 xrSmoothNrm : 1 = 0;
+  u32 tevStagePad : 23 = 0;
   std::array<ColorChannelConfig, MaxColorChannels> colorChannels;
   std::array<TcgConfig, MaxTexCoord> tcgs;
   AlphaCompare alphaCompare;
@@ -563,8 +570,11 @@ bool vtx_decode_enabled() noexcept;
 // (location = index). Shared by the shader generator, the pipeline's vertex
 // layout and the CPU decoder (command_processor.cpp), so they can't disagree.
 enum class DecodedFormat : u8 { U32, F32x2, F32x3, F32x4 };
+// A decoded attribute that's no GXAttr: XR room lighting's smooth normal
+// (ShaderConfig::xrSmoothNrm), model space, F32x3, after the rest.
+constexpr u8 kDecodedXrNrm = 0xFE;
 struct DecodedAttr {
-  u8 attr;  // GXAttr
+  u8 attr;  // GXAttr, or kDecodedXrNrm
   u8 slice; // NBT: 0 normal, 1 binormal, 2 tangent
   DecodedFormat format;
   u8 offset;

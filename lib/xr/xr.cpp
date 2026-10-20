@@ -6026,11 +6026,15 @@ void build_placing_layers(PlacingLayers& out, int mode) {
 // is, or per pixel for the room's part (a comparison, and its cost), or per
 // pixel with facet normals: the stage's unlit draws, which have no normals,
 // lit by the room as their triangles face (a flat-shaded relight of baked
-// stages).
+// stages), or with smooth normals the CPU works out from their triangles
+// where it decodes their vertices (the Quest's default; AURORA_VTX_DECODE=1
+// on a desktop), facets elsewhere. Unlit draws lit by normals are lit
+// relative to the room's light from above: their baked light stays, and the
+// room adds its shading and colour.
 //
 // AURORA_XR_ROOM_LIGHT "source,fighters,stage,unlit,strength,yaw,shading,view"
 // (any leading part; source 0 off, 1 lamp, 2 day, 3 office; shading 0 per
-// vertex, 1 per pixel, 2 facet; view 0 off, 1 lit/unlit, 2 fighters/stage,
+// vertex, 1 per pixel, 2 facet, 3 smooth; view 0 off, 1 lit/unlit, 2 fighters/stage,
 // 3 normals) sets it at launch;
 // the dev tools panel's LIGHT page sets it live and logs each change as
 // that value.
@@ -6055,7 +6059,7 @@ constexpr std::array<RoomPreset, 3> kRoomPresets{{
 struct RoomLight {
   int source = 0; // 0 off, else 1 + a kRoomPresets index
   float fighters = 1.f, stage = 1.f, unlit = 0.f, strength = 1.f, yaw = 0.f; // yaw in degrees
-  int shading = 0; // 0 per vertex, 1 per pixel, 2 per pixel with facet normals where meshes have none
+  int shading = 0; // 0 per vertex, 1 per pixel, 2 per pixel with facet normals where meshes have none, 3 smooth ones
   int view = 0;
 };
 
@@ -6111,7 +6115,7 @@ std::string room_light_value(const RoomLight& r) {
 void room_light_apply(const RoomLight& r) {
   gfx::set_xr_room_light(r.source == 0 ? 0u
                                          : 1u | (r.shading == 1 ? 2u : 0u) | (static_cast<uint32_t>(r.view) & 3u) << 2 |
-                                               (r.shading == 2 ? 16u : 0u));
+                                               (r.shading >= 2 ? 16u : 0u) | (r.shading == 3 ? 32u : 0u));
 }
 
 void init_room_light() {
@@ -6128,7 +6132,7 @@ void init_room_light() {
     r.unlit = std::clamp(f[3], 0.f, 1.f);
     r.strength = std::clamp(f[4], 0.f, 2.f);
     r.yaw = std::fmod(std::fmod(f[5], 360.f) + 360.f, 360.f);
-    r.shading = std::clamp(static_cast<int>(f[6]), 0, 2);
+    r.shading = std::clamp(static_cast<int>(f[6]), 0, 3);
     r.view = std::clamp(static_cast<int>(f[7]), 0, 3);
     Log.info("Room light: AURORA_XR_ROOM_LIGHT={}", room_light_value(r));
   }
@@ -6186,6 +6190,15 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
     for (int l = 0; l < 2; ++l)
       e += std::max(f.dir[l][1], 0.f) * f.col[l][c];
     f.up[c] = std::clamp(e, 0.f, 1.f);
+  }
+  // Unlit draws lit by normals: relative to an up-facing surface's light
+  // (its brightness, as STRENGTH leaves it at 1), as baked stages are lit
+  // from above: their tops keep the baked brightness, taking the room's
+  // colour, and the rest the room's shading. (The sphere's average took in
+  // the dark floor: tops came out twice as bright.)
+  {
+    const float s = std::max(r.strength, 1e-3f);
+    f.w[3] = 1.f / std::max((0.2126f * f.up[0] + 0.7152f * f.up[1] + 0.0722f * f.up[2]) / s, 0.05f);
   }
   return f;
 }
@@ -6368,7 +6381,7 @@ enum { kRlSource, kRlFighters, kRlStage, kRlUnlit, kRlStrength, kRlYaw, kRlShadi
 constexpr int kLightRowY0 = 70, kLightRowStep = 50;
 constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE", "FIGHTERS", "STAGE",   "UNLIT",
                                                        "STRENGTH", "YAW",    "SHADING", "VIEW"};
-constexpr std::array<const char*, 3> kShadingNames{"VERTEX", "PIXEL", "FACET"};
+constexpr std::array<const char*, 4> kShadingNames{"VERTEX", "PIXEL", "FACET", "SMOOTH"};
 constexpr std::array<const char*, 4> kViewNames{"OFF", "LIT", "CLASS", "NORMALS"};
 
 // What's under a laser: a tint slider (kHue..kSat), an Audio row (kAudio +

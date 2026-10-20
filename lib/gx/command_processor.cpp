@@ -507,6 +507,130 @@ static DecodedLayout decode_layout_for(const ShaderConfig& config) noexcept {
   return layout;
 }
 
+// The primitive of the draw being decoded (draw_prim), whose triangles the
+// smooth normals are made from; 0 for a draw with its own index buffer
+// (GX_AURORA_DRAW_INDEXED), which gets none.
+u8 sDrawPrim = 0;
+
+// XR room lighting's SMOOTH shading (kDecodedXrNrm): each vertex's normal,
+// in model space, from the draw's own triangles. Vertices at the same place
+// (same position and matrix) are one point, and a vertex takes the faces
+// around its point within the crease angle (AURORA_XR_ROOM_CREASE, degrees,
+// default 50) of the faces it's a corner of, weighted by area: a curved
+// surface shades smoothly, a corner stays sharp. Which side a normal points
+// doesn't matter (the shader turns it toward the eye), so faces are summed
+// turned to agree, and a mesh's mixed windings don't cancel. Made on a
+// decode cache miss only; a draw's own triangles only (seams between draws
+// keep a crease).
+static void smooth_normals(const DecodedLayout& layout, u16 vtxCount, u8* base, u8 nrmOffset) noexcept {
+  static const float cosCrease = [] {
+    const char* v = std::getenv("AURORA_XR_ROOM_CREASE");
+    const float deg = v != nullptr ? std::strtof(v, nullptr) : 50.f;
+    return std::cos(std::clamp(deg, 0.f, 180.f) * 0.017453292f);
+  }();
+  using V3 = std::array<float, 3>;
+  int posOffset = -1, mtxOffset = -1;
+  for (u8 i = 0; i < layout.count; ++i) {
+    if (layout.attrs[i].attr == GX_VA_POS)
+      posOffset = layout.attrs[i].offset;
+    else if (layout.attrs[i].attr == GX_VA_PNMTXIDX)
+      mtxOffset = layout.attrs[i].offset;
+  }
+  const auto at = [&](u32 v, int offset) { return base + static_cast<size_t>(v) * layout.stride + offset; };
+  for (u32 v = 0; v < vtxCount; ++v)
+    std::memset(at(v, nrmOffset), 0, 12);
+  if (posOffset < 0 || vtxCount < 3)
+    return;
+  static std::vector<V3> pos, area, unit, ref;
+  static std::vector<std::array<u16, 3>> tris;
+  static std::vector<u32> group, first, faces;
+  static std::unordered_map<u64, u32> points;
+  pos.resize(vtxCount);
+  group.resize(vtxCount);
+  points.clear();
+  for (u32 v = 0; v < vtxCount; ++v) {
+    std::memcpy(pos[v].data(), at(v, posOffset), 12);
+    u32 key[4]{};
+    std::memcpy(key, at(v, posOffset), 12);
+    if (mtxOffset >= 0)
+      std::memcpy(&key[3], at(v, mtxOffset), 4);
+    group[v] = points.try_emplace(XXH3_64bits(key, sizeof(key)), static_cast<u32>(points.size())).first->second;
+  }
+  // The triangles, as prepare_idx_buffer makes them.
+  tris.clear();
+  const auto prim = static_cast<GXPrimitive>(sDrawPrim);
+  if (prim == GX_QUADS) {
+    for (u32 v = 0; v + 3 < vtxCount; v += 4) {
+      tris.push_back({u16(v), u16(v + 1), u16(v + 2)});
+      tris.push_back({u16(v + 2), u16(v + 3), u16(v)});
+    }
+  } else if (prim == GX_TRIANGLES) {
+    for (u32 v = 0; v + 2 < vtxCount; v += 3)
+      tris.push_back({u16(v), u16(v + 1), u16(v + 2)});
+  } else if (prim == GX_TRIANGLESTRIP || prim == GX_TRIANGLEFAN) {
+    for (u32 v = 2; v < vtxCount; ++v)
+      tris.push_back({u16(prim == GX_TRIANGLEFAN ? 0 : v - 2), u16(v - 1), u16(v)});
+  }
+  const auto sub = [](const V3& a, const V3& b) { return V3{a[0] - b[0], a[1] - b[1], a[2] - b[2]}; };
+  const auto dot = [](const V3& a, const V3& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+  // Each face's normal (its length twice its area) and unit normal; faces by
+  // point (CSR: first[g] .. first[g + 1]); each vertex's own faces, summed.
+  const size_t n = tris.size();
+  area.resize(n);
+  unit.resize(n);
+  ref.assign(vtxCount, V3{});
+  first.assign(points.size() + 1, 0);
+  for (size_t t = 0; t < n; ++t) {
+    const auto& [a, b, c] = tris[t];
+    const V3 e1 = sub(pos[b], pos[a]), e2 = sub(pos[c], pos[a]);
+    area[t] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    const float len = std::sqrt(dot(area[t], area[t]));
+    if (!(len > 1e-20f) || group[a] == group[b] || group[b] == group[c] || group[a] == group[c]) {
+      unit[t] = {};
+      continue;
+    }
+    unit[t] = {area[t][0] / len, area[t][1] / len, area[t][2] / len};
+    for (const u16 v : tris[t]) {
+      ++first[group[v] + 1];
+      const float s = dot(ref[v], unit[t]) < 0.f ? -1.f : 1.f;
+      for (int k = 0; k < 3; ++k)
+        ref[v][k] += s * unit[t][k];
+    }
+  }
+  for (size_t g = 0; g < points.size(); ++g)
+    first[g + 1] += first[g];
+  faces.resize(first.back());
+  {
+    static std::vector<u32> fill;
+    fill.assign(first.begin(), first.end() - 1);
+    for (size_t t = 0; t < n; ++t)
+      if (unit[t][0] != 0.f || unit[t][1] != 0.f || unit[t][2] != 0.f)
+        for (const u16 v : tris[t])
+          faces[fill[group[v]]++] = static_cast<u32>(t);
+  }
+  for (u32 v = 0; v < vtxCount; ++v) {
+    const float rl = std::sqrt(dot(ref[v], ref[v]));
+    if (!(rl > 1e-6f))
+      continue;
+    const V3 r{ref[v][0] / rl, ref[v][1] / rl, ref[v][2] / rl};
+    V3 sum{};
+    for (u32 i = first[group[v]]; i < first[group[v] + 1]; ++i) {
+      const u32 t = faces[i];
+      const float d = dot(unit[t], r);
+      if (std::abs(d) < cosCrease)
+        continue;
+      const float s = d < 0.f ? -1.f : 1.f;
+      for (int k = 0; k < 3; ++k)
+        sum[k] += s * area[t][k];
+    }
+    const float sl = std::sqrt(dot(sum, sum));
+    if (!(sl > 1e-30f))
+      continue;
+    const V3 out{sum[0] / sl, sum[1] / sl, sum[2] / sl};
+    std::memcpy(at(v, nrmOffset), out.data(), 12);
+  }
+}
+
 static void decode_vertices(const ShaderConfig& config, const DecodedLayout& layout, const u8* raw, u16 vtxCount,
                             u8* base) noexcept {
   enum : u8 { kU32, kColor, kComps };
@@ -518,15 +642,21 @@ static void decode_vertices(const ShaderConfig& config, const DecodedLayout& lay
     u32 compSize, n, words, offset;
   };
   std::array<Plan, std::size(DecodedLayout{}.attrs)> plans;
+  u8 planCount = 0;
+  int smoothOffset = -1;
   for (u8 i = 0; i < layout.count; ++i) {
     const auto& d = layout.attrs[i];
+    if (d.attr == kDecodedXrNrm) {
+      smoothOffset = d.offset;
+      continue;
+    }
     const auto attr = static_cast<GXAttr>(d.attr);
     const auto& m = config.attrs[attr];
     const u8 kind = d.format == DecodedFormat::U32               ? kU32
                     : attr == GX_VA_CLR0 || attr == GX_VA_CLR1 ? kColor
                                                                : kComps;
     const u32 comps = d.format == DecodedFormat::F32x2 ? 2 : d.format == DecodedFormat::F32x3 ? 3 : 4;
-    plans[i] = {&m,
+    plans[planCount++] = {&m,
                 attr,
                 d.slice,
                 kind,
@@ -540,7 +670,7 @@ static void decode_vertices(const ShaderConfig& config, const DecodedLayout& lay
   for (u32 v = 0; v < vtxCount; ++v) {
     const u8* vtx = raw + v * config.vtxStride;
     u8* dst = base + static_cast<size_t>(v) * layout.stride;
-    for (u8 i = 0; i < layout.count; ++i) {
+    for (u8 i = 0; i < planCount; ++i) {
       const auto& p = plans[i];
       bool le = false;
       const u8* src = decoded_source(*p.m, p.attr, p.slice, vtx, le, p.compSize);
@@ -574,6 +704,8 @@ static void decode_vertices(const ShaderConfig& config, const DecodedLayout& lay
         out[3] = std::bit_cast<u32>(f[3]);
     }
   }
+  if (smoothOffset >= 0)
+    smooth_normals(layout, vtxCount, base, static_cast<u8>(smoothOffset));
 }
 
 // Decoded vertices kept across frames (AURORA_VTX_CACHE, default on with the
@@ -690,6 +822,7 @@ DecodeKey decode_key(const ShaderConfig& config, const u8* raw, u16 vtxCount) no
   parts.vtxStride = config.vtxStride;
   parts.decodedAll = config.decodedAll;
   parts.decodedPos = config.decodedPos;
+  parts.pad = config.xrSmoothNrm ? sDrawPrim : 0; // the smooth normals' triangles
   const XXH128_hash_t h = XXH3_128bits(&parts, sizeof(parts));
   return {h.low64, h.high64};
 }
@@ -1012,6 +1145,19 @@ static u8 xr_room_class() noexcept {
     return 0;
   const u32 link = sLinkTag - 1;
   return link == 5 || link == 6 ? 1 : link <= 4 ? 2 : 0;
+}
+
+// SMOOTH shading's normals for the current draw (ShaderConfig::xrSmoothNrm):
+// a stage triangle draw without its own normals, its every attribute
+// decoded, with room for one more.
+static bool xr_room_smooth(const ShaderConfig& sc) noexcept {
+  if ((gfx::xr_room_light() & 32u) == 0 || xr_room_class() != 2 || !sc.decodedAll || sc.lineMode != 0 ||
+      sDrawPrim == 0 || sc.attrs[GX_VA_NRM].attrType != GX_NONE)
+    return false;
+  ShaderConfig with = sc;
+  with.xrSmoothNrm = 1;
+  DecodedLayout layout;
+  return decoded_layout(with, layout);
 }
 
 // AURORA_XR_ROOM_CENSUS=1 (a survey, with or without the room light): how
@@ -1544,6 +1690,13 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       cache.bindGeneration = 0;
     }
   }
+#if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
+  // Not GX state: follows the room light and the draw's link.
+  if (const bool smooth = xr_room_smooth(cache.config.shaderConfig); smooth != cache.config.shaderConfig.xrSmoothNrm) {
+    cache.config.shaderConfig.xrSmoothNrm = smooth;
+    cache.pipelineRef = gfx::pipeline_ref(cache.config);
+  }
+#endif
 
   const bool bindGroupsValid =
       (state.dirty & DirtyTextures) == 0 && cache.bindGeneration == texture::current_bind_generation();
@@ -1631,7 +1784,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
                    "s0.texMap={} s0.chan={} | chan0 lit={} matSrc={} ambSrc={} "
                    "mat=({:.3f},{:.3f},{:.3f},{:.3f}) amb=({:.3f},{:.3f},{:.3f},{:.3f}) "
                    "vtxClr0={} clr0fmt cnt={} type={} desc={} | blend={} src={} dst={} op={} alphaUpd={} numChans={} | posDesc={} posCnt={} posType={} arrStride={}\n",
-                   n, cache.config.shaderConfig.tevStageCount,
+                   n, u32{cache.config.shaderConfig.tevStageCount},
                    c0[0], c0[1], c0[2], c0[3], c1[0], c1[1], c1[2], c1[3],
                    c2[0], c2[1], c2[2], c2[3],
                    underlying(cache.config.shaderConfig.tevStages[0].colorPass.a),
@@ -1896,6 +2049,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
 
 static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& reader) noexcept {
   ZoneScoped;
+  sDrawPrim = prim;
   u32 vtxSize;
   if (g_gxState.lastVtxFmt == fmt)
     LIKELY { vtxSize = g_gxState.lastVtxSize; }
@@ -2234,6 +2388,7 @@ void handle_aurora(ByteReader& reader) noexcept {
     const u32 totalVtxBytes = vtxCount * vtxSize;
     const auto vertexData = reader.take(totalVtxBytes);
     const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
+    sDrawPrim = 0;
     if (indexCount != 0) {
       push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount, vertexData.data());
     }

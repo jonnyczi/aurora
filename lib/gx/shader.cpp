@@ -889,7 +889,9 @@ std::string xr_room_mat_src(const ShaderConfig& config, const ColorChannelConfig
 // it clamped as GX clamps; specular ones (GX_AF_SPEC) the game's own
 // highlight curve (its first light's cos/dist attenuation) toward the
 // room's key light; unlit ones the room's light on an up-facing surface,
-// or with facet normals (xrRoomFacet) on the surface as it faces.
+// or with facet normals (xrRoomFacet) on the surface as it faces, relative
+// to the room's light from above (xr.room_w.w): their baked light stays,
+// the room adds its shading and colour.
 std::string xr_room_mix(const ShaderConfig& config, const ColorChannelConfig& cc, u8 i, std::string_view target,
                         std::string_view nrm, std::string_view mat) {
   const std::string_view weight = !cc.lightingEnabled ? "xr.room_w.z"sv
@@ -897,7 +899,7 @@ std::string xr_room_mix(const ShaderConfig& config, const ColorChannelConfig& cc
                                                        : "xr.room_w.y"sv;
   std::string room;
   if (!cc.lightingEnabled) {
-    room = config.xrRoomFacet ? fmt::format("xr_room_diffuse({})", nrm) : "xr.room_up.rgb"s;
+    room = config.xrRoomFacet ? fmt::format("xr_room_diffuse({}) * xr.room_w.w", nrm) : "xr.room_up.rgb"s;
   } else if (cc.attnFn == GX_AF_SPEC) {
     const std::string_view distAttn = cc.diffFn != GX_DF_NONE
                                           ? "max(0.0, dot(normalize(light.dist_att), vec3f(1.0, attn, attn * attn)))"sv
@@ -1400,6 +1402,10 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
                         : d.format == DecodedFormat::F32x3 ? "vec3f"sv
                                                            : "vec4f"sv;
       vtxInAttrs += fmt::format(",\n    @location({}) dv{}: {}", loc, loc, type);
+      if (d.attr == kDecodedXrNrm) {
+        vtxXfrAttrsPre += fmt::format("\n    let in_xr_sn = dv{};", loc);
+        continue;
+      }
       const auto attr = static_cast<GXAttr>(d.attr);
       if (attr == GX_VA_NRM && d.slice != 0) {
         nbtLocation[d.slice] = loc;
@@ -1486,12 +1492,16 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
   // derivatives of its camera-space position. Their order alone turns it
   // toward this eye (screen y runs down); a test against the game camera's
   // origin flips surfaces whose plane runs between that camera and the eye.
+  // Smooth normals (xrSmoothNrm): the CPU's, from the decoded vertex, by the
+  // position matrix's cofactors (its inverse transpose, up to scale), turned
+  // as the facet faces; the facet's where a vertex has none.
   const bool xrRoom = viewCount > 1 && config.xrRoom != 0;
   const bool xrRoomHasNrm = config.attrs[GX_VA_NRM].attrType != GX_NONE;
   const std::string_view xrRoomNrm = xrRoomHasNrm ? "mv_nrm"sv : "vec3f(0.0)"sv;
   const bool xrRoomNrmOut =
       xrRoom && xrRoomHasNrm && (config.xrRoomPixel || config.xrRoomView == 3 || config.xrRoomFacet);
   const bool xrRoomFacetNrm = xrRoom && !xrRoomHasNrm && config.xrRoomFacet && config.lineMode == 0;
+  const bool xrRoomSmoothNrm = xrRoomFacetNrm && config.xrSmoothNrm && config.decodedAll;
   const std::string_view xrRoomNrmPx = xrRoomNrmOut || xrRoomFacetNrm ? "xr_n"sv : "vec3f(0.0)"sv;
   if (xrRoomNrmOut) {
     vtxOutAttrs += fmt::format("\n    @location({}) xr_n: vec3f,", vtxOutIdx++);
@@ -1499,6 +1509,13 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
   } else if (xrRoomFacetNrm) {
     vtxOutAttrs += fmt::format("\n    @location({}) xr_p: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.xr_p = mv_pos;";
+    if (xrRoomSmoothNrm) {
+      vtxOutAttrs += fmt::format("\n    @location({}) xr_sn: vec3f,", vtxOutIdx++);
+      vtxXfrAttrsPre += "\n    let xr_m = ubuf.postex_mtx[in_pnmtxidx];"
+                        "\n    let xr_r0 = xr_m[0].xyz; let xr_r1 = xr_m[1].xyz; let xr_r2 = xr_m[2].xyz;"
+                        "\n    out.xr_sn = vec3f(dot(cross(xr_r1, xr_r2), in_xr_sn), dot(cross(xr_r2, xr_r0), in_xr_sn),"
+                        " dot(cross(xr_r0, xr_r1), in_xr_sn));";
+    }
   }
 
   uniBufAttrs += "\n    proj: mat4x4f,";
@@ -1598,8 +1615,15 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
   if (xrRoomNrmOut) {
     fragmentFnPre += "\n    let xr_n = select(vec3f(0.0), normalize(in.xr_n), dot(in.xr_n, in.xr_n) > 1e-12);";
   } else if (xrRoomFacetNrm) {
-    fragmentFnPre += "\n    let xr_f = cross(dpdy(in.xr_p), dpdx(in.xr_p));"
-                     "\n    let xr_n = select(vec3f(0.0), normalize(xr_f), dot(xr_f, xr_f) > 1e-30);";
+    fragmentFnPre += "\n    let xr_f = cross(dpdy(in.xr_p), dpdx(in.xr_p));";
+    if (xrRoomSmoothNrm) {
+      fragmentFnPre += "\n    let xr_nf = select(vec3f(0.0), normalize(xr_f), dot(xr_f, xr_f) > 1e-30);"
+                       "\n    let xr_sn = select(vec3f(0.0), normalize(in.xr_sn), dot(in.xr_sn, in.xr_sn) > 1e-30);"
+                       "\n    let xr_n = select(xr_nf, select(xr_sn, -xr_sn, dot(xr_sn, xr_nf) < 0.0), "
+                       "dot(xr_sn, xr_sn) > 0.0);";
+    } else {
+      fragmentFnPre += "\n    let xr_n = select(vec3f(0.0), normalize(xr_f), dot(xr_f, xr_f) > 1e-30);";
+    }
   }
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (!info.sampledColorChannels.test(i)) {
