@@ -6078,16 +6078,22 @@ struct {
 // of mean colour, over its exposure times sensitivity (relative radiance),
 // lands by the ray of each cell (the lens's intrinsics, its pose against the
 // head, the head's latest pose) in a cube of kCapN x kCapN cells a face, in
-// the room. The light is remade every few frames: the brightest cell's
-// excess over the cells around it as the key light, the rest as SH L2 as
-// the presets' (room_sh), unseen cells filled from their hemisphere's seen
+// the room. A cell's radiance is the mean of the frames that showed it
+// unclipped (auto exposure adapts as the head turns to a lamp), else of the
+// clipped ones, boosted by how much clipped (a lower bound, and a lamp seen
+// only clipped would otherwise vanish into the sky). The light is remade
+// every few frames: up to two lights, the brightest cells at least 45
+// degrees apart, by their excess over the mean (the shader's key and fill;
+// a window and a ceiling light both count), the rest as SH L2 as the
+// presets' (room_sh), unseen cells filled from their hemisphere's seen
 // ones, all scaled so an up-facing surface gets kCapUp (the camera's
 // brightness is passthrough's auto exposure, so a dark room and a bright
 // one come out alike; STRENGTH changes it).
 constexpr int kCapN = 8;
 constexpr int kCapCells = 6 * kCapN * kCapN;
 constexpr int64_t kCaptureNs = 20'000'000'000;
-constexpr float kCapUp = 0.8f;
+constexpr float kCapUp = 0.6f; // 0.8 and STRENGTH 0.75 matched a room on the headset
+constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
 struct {
@@ -6097,13 +6103,14 @@ struct {
   bool haveCamera = false;
   float q[4]{0.f, 0.f, 0.f, 1.f}, t[3]{}, k[4]{};
   int sensorW = 0, sensorH = 0, w = 0, h = 0;
-  std::array<std::array<double, 4>, kCapCells> cells{}; // r, g, b sums and their count
+  // r, g, b sums and their count: unclipped frames, then clipped (boosted).
+  std::array<std::array<double, 8>, kCapCells> cells{};
   uint32_t frames = 0, sinceMade = 0;
   float exposure = -1.f, iso = -1.f;
   // The light last made from them (made: any).
   bool made = false;
   std::array<std::array<float, 3>, 9> sh{};
-  std::array<float, 3> keyDir{0.f, 1.f, 0.f}, key{};
+  std::array<std::array<float, 3>, 2> lightDir{{{0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}}}, light{};
   float coverage = 0.f;
 } g_capture;
 
@@ -6150,7 +6157,9 @@ void capture_make() {
   double hemiN[2]{};
   int seenN = 0;
   for (int i = 0; i < kCapCells; ++i) {
-    if (c.cells[i][3] <= 0.0)
+    const auto& e = c.cells[i];
+    const int o = e[3] > 0.0 ? 0 : e[7] > 0.0 ? 4 : -1;
+    if (o < 0)
       continue;
     seen[i] = true;
     ++seenN;
@@ -6158,7 +6167,7 @@ void capture_make() {
     const auto d = cap_dir(i, dw);
     const int h = d[1] >= 0.f ? 0 : 1;
     for (int k = 0; k < 3; ++k) {
-      L[i][k] = c.cells[i][k] / c.cells[i][3];
+      L[i][k] = e[o + k] / e[o + 3];
       hemi[h][k] += L[i][k];
     }
     hemiN[h] += 1.0;
@@ -6174,27 +6183,45 @@ void capture_make() {
       const auto d = cap_dir(i, dw);
       L[i] = hemi[d[1] >= 0.f ? 0 : 1];
     }
-  // The key: the brightest seen cell, its excess over the mean of what was
-  // seen, taken out of the sky as a directional light of that irradiance
-  // over pi (as the presets' lights are).
-  int best = -1;
-  double bestLum = 0.0, meanLum = 0.0;
-  for (int i = 0; i < kCapCells; ++i) {
-    const double lum = 0.2126 * L[i][0] + 0.7152 * L[i][1] + 0.0722 * L[i][2];
-    meanLum += lum / kCapCells;
-    if (seen[i] && lum > bestLum)
-      bestLum = lum, best = i;
-  }
-  std::array<double, 3> key{};
-  std::array<float, 3> keyDir{0.f, 1.f, 0.f};
-  if (best >= 0 && bestLum > 2.0 * meanLum) {
+  // The lights: the brightest seen cells, at least 45 degrees apart, each
+  // its excess over the mean of the room taken out of the sky as a
+  // directional light of that irradiance over pi (as the presets' are).
+  const auto lum_of = [](const std::array<double, 3>& v) { return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]; };
+  const auto unit_dir = [](int cell) {
     float dw;
-    const auto d = cap_dir(best, dw);
+    const auto d = cap_dir(cell, dw);
     const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-    keyDir = {d[0] / dl, d[1] / dl, d[2] / dl};
+    return std::array<float, 3>{d[0] / dl, d[1] / dl, d[2] / dl};
+  };
+  double meanLum = 0.0;
+  for (int i = 0; i < kCapCells; ++i)
+    meanLum += lum_of(L[i]) / kCapCells;
+  std::array<std::array<double, 3>, 2> light{};
+  std::array<std::array<float, 3>, 2> lightDir{{{0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}}};
+  int picked[2] = {-1, -1};
+  for (int l = 0; l < 2; ++l) {
+    int best = -1;
+    double bestLum = 2.0 * meanLum;
+    for (int i = 0; i < kCapCells; ++i) {
+      if (!seen[i] || i == picked[0])
+        continue;
+      if (l == 1 && picked[0] >= 0) {
+        const auto a = unit_dir(i), b = unit_dir(picked[0]);
+        if (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] > 0.7071f)
+          continue;
+      }
+      if (const double lum = lum_of(L[i]); lum > bestLum)
+        bestLum = lum, best = i;
+    }
+    if (best < 0)
+      break;
+    picked[l] = best;
+    float dw;
+    cap_dir(best, dw);
+    lightDir[l] = unit_dir(best);
     for (int k = 0; k < 3; ++k) {
       const double excess = std::max(L[best][k] - meanLum, 0.0);
-      key[k] = excess * dw / 3.14159265358979323846;
+      light[l][k] = excess * dw / 3.14159265358979323846;
       L[best][k] -= excess;
     }
   }
@@ -6220,7 +6247,8 @@ void capture_make() {
   // Scaled so an up-facing surface gets kCapUp (as room_frame's up).
   double up[3];
   for (int ch = 0; ch < 3; ++ch)
-    up[ch] = sh[0][ch] + sh[1][ch] - sh[6][ch] - sh[8][ch] + std::max(keyDir[1], 0.f) * key[ch];
+    up[ch] = sh[0][ch] + sh[1][ch] - sh[6][ch] - sh[8][ch] + std::max(lightDir[0][1], 0.f) * light[0][ch] +
+             std::max(lightDir[1][1], 0.f) * light[1][ch];
   const double upLum = 0.2126 * up[0] + 0.7152 * up[1] + 0.0722 * up[2];
   if (!(upLum > 1e-12))
     return;
@@ -6228,9 +6256,10 @@ void capture_make() {
   for (int k = 0; k < 9; ++k)
     for (int ch = 0; ch < 3; ++ch)
       c.sh[k][ch] = static_cast<float>(sh[k][ch] * scale);
-  for (int ch = 0; ch < 3; ++ch)
-    c.key[ch] = static_cast<float>(key[ch] * scale);
-  c.keyDir = keyDir;
+  for (int l = 0; l < 2; ++l)
+    for (int ch = 0; ch < 3; ++ch)
+      c.light[l][ch] = static_cast<float>(light[l][ch] * scale);
+  c.lightDir = lightDir;
   c.coverage = static_cast<float>(seenN) / kCapCells;
   c.made = true;
 }
@@ -6247,14 +6276,43 @@ void capture_start() {
 }
 
 // The captured light for room_frame: false while none is made.
-bool capture_light(std::array<std::array<float, 3>, 9>& sh, std::array<float, 3>& keyDir, std::array<float, 3>& key) {
+bool capture_light(std::array<std::array<float, 3>, 9>& sh, std::array<std::array<float, 3>, 2>& dirs,
+                   std::array<std::array<float, 3>, 2>& lights) {
   std::lock_guard lock{g_capture.mutex};
   if (!g_capture.made)
     return false;
   sh = g_capture.sh;
-  keyDir = g_capture.keyDir;
-  key = g_capture.key;
+  dirs = g_capture.lightDir;
+  lights = g_capture.light;
   return true;
+}
+
+// The capture's brightest cells, for the log: where, how bright (relative
+// to the mean), and how many of their frames clipped.
+std::string capture_brightest() {
+  auto& c = g_capture;
+  std::array<std::pair<double, int>, kCapCells> order;
+  double mean = 0.0;
+  int n = 0;
+  for (int i = 0; i < kCapCells; ++i) {
+    const auto& e = c.cells[i];
+    const int o = e[3] > 0.0 ? 0 : e[7] > 0.0 ? 4 : -1;
+    const double lum = o < 0 ? 0.0 : (0.2126 * e[o] + 0.7152 * e[o + 1] + 0.0722 * e[o + 2]) / e[o + 3];
+    order[i] = {lum, i};
+    mean += lum, n += o >= 0;
+  }
+  mean /= std::max(n, 1);
+  std::partial_sort(order.begin(), order.begin() + 6, order.end(), std::greater<>());
+  std::string out;
+  for (int k = 0; k < 6 && order[k].first > 0.0; ++k) {
+    float dw;
+    const auto d = cap_dir(order[k].second, dw);
+    const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    const auto& e = c.cells[order[k].second];
+    out += fmt::format(" {:.2f},{:.2f},{:.2f} x{:.1f} ({:.0f} clear, {:.0f} clipped);", d[0] / dl, d[1] / dl, d[2] / dl,
+                       order[k].first / std::max(mean, 1e-12), e[3], e[7]);
+  }
+  return out;
 }
 
 // The Light page's ROOM segment while a capture runs: how much of the room
@@ -6361,10 +6419,10 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
     if (r.source != kRoomSourceCaptured)
       sh = g_room.sh[r.source - 1];
   }
-  // The captured room: its key (no fill), already in the room.
-  std::array<float, 3> capKeyDir, capKey;
+  // The captured room: its two lights, already in the room.
+  std::array<std::array<float, 3>, 2> capDirs, capLights;
   const bool captured = r.source == kRoomSourceCaptured;
-  if (captured && !capture_light(sh, capKeyDir, capKey))
+  if (captured && !capture_light(sh, capDirs, capLights))
     return f;
   const RoomPreset& p = kRoomPresets[captured ? 0 : r.source - 1];
   f.on = true;
@@ -6390,14 +6448,12 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
     for (int c = 0; c < 3; ++c)
       f.col[l][c] = (*cols[l])[c] * r.strength;
   }
-  if (captured) {
-    f.dir[0] = capKeyDir;
-    f.dir[1] = {0.f, 1.f, 0.f};
-    for (int c = 0; c < 3; ++c) {
-      f.col[0][c] = capKey[c] * r.strength;
-      f.col[1][c] = 0.f;
+  if (captured)
+    for (int l = 0; l < 2; ++l) {
+      f.dir[l] = capDirs[l];
+      for (int c = 0; c < 3; ++c)
+        f.col[l][c] = capLights[l][c] * r.strength;
     }
-  }
   // An up-facing surface's light, for unlit draws (as xr_room_diffuse at up).
   for (int c = 0; c < 3; ++c) {
     float e = f.sh[0][c] + f.sh[1][c] - f.sh[6][c] - f.sh[8][c];
@@ -10830,8 +10886,11 @@ extern "C" int aurora_xr_room_capture_wanted(void) {
   if (c.untilNs != 0 && steady_ns() >= c.untilNs) {
     c.requested = false;
     capture_make();
-    Log.info("Room capture: {} frames, {:.0f}% of the room seen; key light {:.2f} {:.2f} {:.2f} from {:.2f},{:.2f},{:.2f}",
-             c.frames, c.coverage * 100.f, c.key[0], c.key[1], c.key[2], c.keyDir[0], c.keyDir[1], c.keyDir[2]);
+    Log.info("Room capture: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
+             "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f}; brightest cells (room x,y,z; times the mean):{}",
+             c.frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
+             c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
+             c.lightDir[1][1], c.lightDir[1][2], capture_brightest());
     return 0;
   }
   return 1;
@@ -10893,10 +10952,13 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
       const int cell = cap_cell(inRoom);
       if (cell < 0)
         continue;
-      const float* p = rgb + (gy * cols + gx) * 3;
+      const float* p = rgb + (gy * cols + gx) * 4;
+      const bool clipped = p[3] > kCapClipped;
+      const double s = scale * (clipped ? 1.0 + kCapClipBoost * p[3] : 1.0);
+      const int o = clipped ? 4 : 0;
       for (int k = 0; k < 3; ++k)
-        c.cells[cell][k] += static_cast<double>(p[k]) * scale;
-      c.cells[cell][3] += 1.0;
+        c.cells[cell][o + k] += static_cast<double>(p[k]) * s;
+      c.cells[cell][o + 3] += 1.0;
     }
   c.exposure = exposure_ms, c.iso = iso;
   ++c.frames;
