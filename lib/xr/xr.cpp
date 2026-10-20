@@ -6086,13 +6086,23 @@ struct {
 // degrees apart, by their excess over the mean (the shader's key and fill;
 // a window and a ceiling light both count), the rest as SH L2 as the
 // presets' (room_sh), unseen cells filled from their hemisphere's seen
-// ones, all scaled so an up-facing surface gets kCapUp (the camera's
-// brightness is passthrough's auto exposure, so a dark room and a bright
-// one come out alike; STRENGTH changes it).
+// ones. Its level is the room's as passthrough shows it: an up-facing
+// surface's light in the frames' own pixel scale (the relative radiance
+// times the capture's median exposure times sensitivity, undoing what auto
+// exposure took out), by kCapDisplay, is the level (ABL). In room_frame the
+// stage's unlit draws take it from above (their tops the baked colour times
+// the level, times STRENGTH), and the fighters as the room's mean light
+// over every direction (kCapFighters times the level): a backlit room
+// shades their front, but on average they keep the game's brightness.
 constexpr int kCapN = 8;
 constexpr int kCapCells = 6 * kCapN * kCapN;
 constexpr int64_t kCaptureNs = 20'000'000'000;
-constexpr float kCapUp = 0.6f; // 0.8 and STRENGTH 0.75 matched a room on the headset
+// The level per unit of passthrough brightness: PROVISIONAL (T4 found the
+// camera's mean linear luminance about 0.16 in a room the stage looked
+// right in, and the user matched one at 0.75), to be set from a capture's
+// log in a room the user matched; and the fighters' mean light at level 1.
+constexpr float kCapDisplay = 5.f;
+constexpr float kCapFighters = 0.7f;
 constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
@@ -6107,6 +6117,8 @@ struct {
   std::array<std::array<double, 8>, kCapCells> cells{};
   uint32_t frames = 0, sinceMade = 0;
   float exposure = -1.f, iso = -1.f;
+  std::vector<float> factors; // each frame's exposure (ms) times ISO over 100
+  float mean = 1.f, display = 0.f, level = 1.f; // mean light (up 1), passthrough's up, level
   // The light last made from them (made: any).
   bool made = false;
   std::array<std::array<float, 3>, 9> sh{};
@@ -6244,7 +6256,7 @@ void capture_make() {
   for (int k = 0; k < 9; ++k)
     for (int ch = 0; ch < 3; ++ch)
       sh[k][ch] = acc[k][ch] * lobe[k] * basis[k];
-  // Scaled so an up-facing surface gets kCapUp (as room_frame's up).
+  // Scaled so an up-facing surface gets 1 (as room_frame's up), the level apart.
   double up[3];
   for (int ch = 0; ch < 3; ++ch)
     up[ch] = sh[0][ch] + sh[1][ch] - sh[6][ch] - sh[8][ch] + std::max(lightDir[0][1], 0.f) * light[0][ch] +
@@ -6252,7 +6264,18 @@ void capture_make() {
   const double upLum = 0.2126 * up[0] + 0.7152 * up[1] + 0.0722 * up[2];
   if (!(upLum > 1e-12))
     return;
-  const double scale = kCapUp / upLum;
+  // Up-facing light 1; the level from passthrough's brightness.
+  const double scale = 1.0 / upLum;
+  float median = 1.f;
+  if (!c.factors.empty()) {
+    std::vector<float> f = c.factors;
+    std::nth_element(f.begin(), f.begin() + f.size() / 2, f.end());
+    median = f[f.size() / 2];
+  }
+  c.display = static_cast<float>(upLum * median);
+  c.level = std::clamp(kCapDisplay * c.display, 0.15f, 1.25f);
+  c.mean = static_cast<float>((0.2126 * sh[0][0] + 0.7152 * sh[0][1] + 0.0722 * sh[0][2] +
+                               0.25 * (lum_of(light[0]) + lum_of(light[1]))) * scale);
   for (int k = 0; k < 9; ++k)
     for (int ch = 0; ch < 3; ++ch)
       c.sh[k][ch] = static_cast<float>(sh[k][ch] * scale);
@@ -6273,17 +6296,20 @@ void capture_start() {
   g_capture.frames = g_capture.sinceMade = 0;
   g_capture.made = false;
   g_capture.coverage = 0.f;
+  g_capture.factors.clear();
 }
 
 // The captured light for room_frame: false while none is made.
 bool capture_light(std::array<std::array<float, 3>, 9>& sh, std::array<std::array<float, 3>, 2>& dirs,
-                   std::array<std::array<float, 3>, 2>& lights) {
+                   std::array<std::array<float, 3>, 2>& lights, float& mean, float& level) {
   std::lock_guard lock{g_capture.mutex};
   if (!g_capture.made)
     return false;
   sh = g_capture.sh;
   dirs = g_capture.lightDir;
   lights = g_capture.light;
+  mean = g_capture.mean;
+  level = g_capture.level;
   return true;
 }
 
@@ -6421,16 +6447,21 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   }
   // The captured room: its two lights, already in the room.
   std::array<std::array<float, 3>, 2> capDirs, capLights;
+  float capMean = 1.f, capLevel = 1.f;
   const bool captured = r.source == kRoomSourceCaptured;
-  if (captured && !capture_light(sh, capDirs, capLights))
+  if (captured && !capture_light(sh, capDirs, capLights, capMean, capLevel))
     return f;
+  // The captured room's level (ABL, by STRENGTH), and the fighters' scale:
+  // the room's mean light to kCapFighters times it.
+  const float level = r.strength * capLevel;
+  const float gain = captured ? level * kCapFighters / std::max(capMean, 1e-3f) : r.strength;
   const RoomPreset& p = kRoomPresets[captured ? 0 : r.source - 1];
   f.on = true;
   f.w[0] = r.fighters, f.w[1] = r.stage, f.w[2] = r.unlit;
   f.delight = r.delight;
   for (int k = 0; k < 9; ++k)
     for (int c = 0; c < 3; ++c)
-      f.sh[k][c] = sh[k][c] * r.strength;
+      f.sh[k][c] = sh[k][c] * gain;
   // The lights' directions: turned by YAW about the stage's up, then by the
   // stage's placement into the room.
   const float yaw = r.yaw * 0.017453292f, cy = std::cos(yaw), sy = std::sin(yaw);
@@ -6452,7 +6483,7 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
     for (int l = 0; l < 2; ++l) {
       f.dir[l] = capDirs[l];
       for (int c = 0; c < 3; ++c)
-        f.col[l][c] = capLights[l][c] * r.strength;
+        f.col[l][c] = capLights[l][c] * gain;
     }
   // An up-facing surface's light, for unlit draws (as xr_room_diffuse at up).
   for (int c = 0; c < 3; ++c) {
@@ -6468,7 +6499,9 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   // the dark floor: tops came out twice as bright.)
   {
     const float s = std::max(r.strength, 1e-3f);
-    f.w[3] = 1.f / std::max((0.2126f * f.up[0] + 0.7152f * f.up[1] + 0.0722f * f.up[2]) / s, 0.05f);
+    const float upLum = 0.2126f * f.up[0] + 0.7152f * f.up[1] + 0.0722f * f.up[2];
+    // The captured room's: its tops the baked colour times the level.
+    f.w[3] = captured ? level / std::max(upLum, 0.05f * gain) : 1.f / std::max(upLum / s, 0.05f);
   }
   return f;
 }
@@ -10887,10 +10920,11 @@ extern "C" int aurora_xr_room_capture_wanted(void) {
     c.requested = false;
     capture_make();
     Log.info("Room capture: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
-             "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f}; brightest cells (room x,y,z; times the mean):{}",
+             "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f}; passthrough's up {:.4f}, level {:.2f}; "
+             "brightest cells (room x,y,z; times the mean):{}",
              c.frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
              c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
-             c.lightDir[1][1], c.lightDir[1][2], capture_brightest());
+             c.lightDir[1][1], c.lightDir[1][2], c.display, c.level, capture_brightest());
     return 0;
   }
   return 1;
@@ -10961,6 +10995,8 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
       c.cells[cell][o + 3] += 1.0;
     }
   c.exposure = exposure_ms, c.iso = iso;
+  if (exposure_ms > 0.f && iso > 0.f)
+    c.factors.push_back(exposure_ms * iso / 100.f);
   ++c.frames;
   if (++c.sinceMade >= 5) {
     c.sinceMade = 0;
