@@ -450,7 +450,7 @@ bool decoded_layout(const ShaderConfig& config, DecodedLayout& out) noexcept {
     }
   }
   if (config.xrSmoothNrm && config.attrs[GX_VA_NRM].attrType == GX_NONE) {
-    return add(kDecodedXrNrm, 0, DecodedFormat::F32x3);
+    return add(kDecodedXrNrm, 0, DecodedFormat::F32x4);
   }
   return true;
 }

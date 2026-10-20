@@ -571,7 +571,8 @@ bool vtx_decode_enabled() noexcept;
 // layout and the CPU decoder (command_processor.cpp), so they can't disagree.
 enum class DecodedFormat : u8 { U32, F32x2, F32x3, F32x4 };
 // A decoded attribute that's no GXAttr: XR room lighting's smooth normal
-// (ShaderConfig::xrSmoothNrm), model space, F32x3, after the rest.
+// (ShaderConfig::xrSmoothNrm), model space, and the vertex's de-light factor
+// (w), F32x4, after the rest.
 constexpr u8 kDecodedXrNrm = 0xFE;
 struct DecodedAttr {
   u8 attr;  // GXAttr, or kDecodedXrNrm

@@ -138,11 +138,18 @@ bool xr_recording_world() noexcept;
 // FIFO thread: a world clip is set (its draws need the clipping pipelines).
 bool xr_soft_clip_active() noexcept;
 // XR room lighting (lib/xr's dev tools), for the eye pipelines: 0 off, else
-// bit 0 on, bit 1 per pixel, bits 2-3 the debug view, bit 4 facet normals
-// (ShaderConfig::xrRoom*).
+// bit 0 on, bit 1 per pixel, bits 2-3 the debug view, bit 4 facet normals,
+// bit 5 smooth ones (ShaderConfig::xrRoom*, xrSmoothNrm).
 // Any thread.
 void set_xr_room_light(uint32_t bits) noexcept;
 uint32_t xr_room_light() noexcept;
+// XR room lighting's fit of a stage's baked light: a new stage (any thread,
+// aurora_xr_set_stage) starts another, the FIFO thread sees the count change.
+void xr_room_fit_reset() noexcept;
+uint32_t xr_room_fit_epoch() noexcept;
+// FIFO thread: the game's world -> camera 3x4 (row-major) of the frame being
+// recorded, null before its world view is set.
+const float* xr_world_view() noexcept;
 // FIFO thread: the current world clip as the eye shaders test it, in game
 // camera space (planes kept where dot >= 0, against vec4(mv_pos, 1)), with
 // each plane's fade band (game units, 0 = hard) and the draw's opacity. Unused

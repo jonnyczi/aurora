@@ -6032,10 +6032,11 @@ void build_placing_layers(PlacingLayers& out, int mode) {
 // relative to the room's light from above: their baked light stays, and the
 // room adds its shading and colour.
 //
-// AURORA_XR_ROOM_LIGHT "source,fighters,stage,unlit,strength,yaw,shading,view"
+// AURORA_XR_ROOM_LIGHT "source,fighters,stage,unlit,strength,yaw,shading,view,delight"
 // (any leading part; source 0 off, 1 lamp, 2 day, 3 office; shading 0 per
 // vertex, 1 per pixel, 2 facet, 3 smooth; view 0 off, 1 lit/unlit, 2 fighters/stage,
-// 3 normals) sets it at launch;
+// 3 normals; delight 0 to 1, how much of a fit of the stage's baked light
+// SMOOTH divides out of its vertex colours) sets it at launch;
 // the dev tools panel's LIGHT page sets it live and logs each change as
 // that value.
 
@@ -6061,6 +6062,7 @@ struct RoomLight {
   float fighters = 1.f, stage = 1.f, unlit = 0.f, strength = 1.f, yaw = 0.f; // yaw in degrees
   int shading = 0; // 0 per vertex, 1 per pixel, 2 per pixel with facet normals where meshes have none, 3 smooth ones
   int view = 0;
+  float delight = 1.f;
 };
 
 struct {
@@ -6107,8 +6109,8 @@ std::array<std::array<float, 3>, 9> room_sh(const RoomPreset& p) {
 }
 
 std::string room_light_value(const RoomLight& r) {
-  return fmt::format("{},{:.2f},{:.2f},{:.2f},{:.2f},{:.0f},{},{}", r.source, r.fighters, r.stage, r.unlit, r.strength,
-                     r.yaw, r.shading, r.view);
+  return fmt::format("{},{:.2f},{:.2f},{:.2f},{:.2f},{:.0f},{},{},{:.2f}", r.source, r.fighters, r.stage, r.unlit,
+                     r.strength, r.yaw, r.shading, r.view, r.delight);
 }
 
 // The eye pipelines' variant bits (gfx::set_xr_room_light).
@@ -6124,8 +6126,8 @@ void init_room_light() {
     g_room.sh[i] = room_sh(kRoomPresets[i]);
   RoomLight r;
   if (const char* v = std::getenv("AURORA_XR_ROOM_LIGHT")) {
-    float f[8] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f};
-    std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7]);
+    float f[9] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f, r.delight};
+    std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7], &f[8]);
     r.source = std::clamp(static_cast<int>(f[0]), 0, static_cast<int>(kRoomPresets.size()));
     r.fighters = std::clamp(f[1], 0.f, 1.f);
     r.stage = std::clamp(f[2], 0.f, 1.f);
@@ -6134,6 +6136,7 @@ void init_room_light() {
     r.yaw = std::fmod(std::fmod(f[5], 360.f) + 360.f, 360.f);
     r.shading = std::clamp(static_cast<int>(f[6]), 0, 3);
     r.view = std::clamp(static_cast<int>(f[7]), 0, 3);
+    r.delight = std::clamp(f[8], 0.f, 1.f);
     Log.info("Room light: AURORA_XR_ROOM_LIGHT={}", room_light_value(r));
   }
   g_room.value = g_room.defaults = r;
@@ -6147,6 +6150,7 @@ struct RoomFrame {
   float sh[9][4]{};
   std::array<float, 3> dir[2]{}; // in the room
   float col[2][4]{};
+  float delight = 0.f;
 };
 
 // `arena`: the stage's placement (its rotation about y and scale).
@@ -6164,6 +6168,7 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   const RoomPreset& p = kRoomPresets[r.source - 1];
   f.on = true;
   f.w[0] = r.fighters, f.w[1] = r.stage, f.w[2] = r.unlit;
+  f.delight = r.delight;
   for (int k = 0; k < 9; ++k)
     for (int c = 0; c < 3; ++c)
       f.sh[k][c] = sh[k][c] * r.strength;
@@ -6377,10 +6382,10 @@ constexpr std::array<Rgba, AURORA_XR_MIX_BANDS> kBandColors{Rgba{255, 170, 80, 2
                                                             Rgba{190, 150, 255, 255}};
 
 // The Light page (room lighting): a row each, choices or sliders.
-enum { kRlSource, kRlFighters, kRlStage, kRlUnlit, kRlStrength, kRlYaw, kRlShading, kRlView, kRlRows };
-constexpr int kLightRowY0 = 70, kLightRowStep = 50;
-constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE", "FIGHTERS", "STAGE",   "UNLIT",
-                                                       "STRENGTH", "YAW",    "SHADING", "VIEW"};
+enum { kRlSource, kRlFighters, kRlStage, kRlUnlit, kRlDelight, kRlStrength, kRlYaw, kRlShading, kRlView, kRlRows };
+constexpr int kLightRowY0 = 70, kLightRowStep = 44;
+constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE",   "FIGHTERS", "STAGE",   "UNLIT", "DELIGHT",
+                                                       "STRENGTH", "YAW",      "SHADING", "VIEW"};
 constexpr std::array<const char*, 4> kShadingNames{"VERTEX", "PIXEL", "FACET", "SMOOTH"};
 constexpr std::array<const char*, 4> kViewNames{"OFF", "LIT", "CLASS", "NORMALS"};
 
@@ -6772,6 +6777,7 @@ std::vector<const char*> light_choices(int row) {
 float light_max(int row) { return row == kRlStrength ? 2.f : row == kRlYaw ? 360.f : 1.f; }
 float& light_slider(RoomLight& r, int row) {
   return row == kRlFighters ? r.fighters : row == kRlStage ? r.stage : row == kRlUnlit ? r.unlit
+                                         : row == kRlDelight  ? r.delight
                                          : row == kRlStrength ? r.strength : r.yaw;
 }
 
@@ -9846,6 +9852,7 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
           u.roomL[c] = l[c];
           u.roomH[c] = hl > 1e-12f ? h[c] / hl : 0.f;
         }
+        u.roomH[3] = room.delight;
       }
     for (size_t t = 0; t < transforms; ++t)
       webgpu::g_queue.WriteBuffer(R.mvUniforms[t], 0, &mv[t], sizeof(mv[t]));
@@ -10672,6 +10679,7 @@ extern "C" void aurora_xr_set_room_grade(float r, float g, float b, float satura
 extern "C" void aurora_xr_set_stage(int stage, float x, float y, float z, float scale) {
   using namespace aurora::xr;
   surface_request(0, true); // another stage: what was under the last one isn't under it
+  aurora::gfx::xr_room_fit_reset(); // and its baked light is another
   {
     std::lock_guard lock{g_grade.mutex};
     g_grade.stage = stage;

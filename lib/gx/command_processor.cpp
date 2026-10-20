@@ -512,36 +512,130 @@ static DecodedLayout decode_layout_for(const ShaderConfig& config) noexcept {
 // (GX_AURORA_DRAW_INDEXED), which gets none.
 u8 sDrawPrim = 0;
 
+// XR room lighting's fit of the stage's baked light (SMOOTH shading): the
+// luminance of the vertex colours the stage's unlit draws are lit by, as a
+// function of the outward normal in the stage's world, c0 + c1 x + c2 y +
+// c3 z, least squares weighted by area. Made from the draws as they first
+// decode, and fixed once 30 frames bring no more (a new generation in the
+// decode key: they decode again, now with each vertex's de-light factor,
+// the fit up over the fit at its normal: the baked light divided out, as
+// the light from above; as much of it as the fit explains). AURORA_XR_ROOM_FIT=0
+// leaves it out (an A/B). aurora_xr_set_stage starts another.
+struct RoomFit {
+  u32 epoch = 0; // gfx::xr_room_fit_epoch() it's for
+  u32 gen = 1;   // in the smooth draws' decode key
+  bool frozen = false, valid = false;
+  double ata[4][4]{}, atb[4]{}, btb = 0.0;
+  u64 verts = 0;
+  u32 draws = 0, lastAdd = 0;
+  float c[4]{};
+  float trust = 0.f; // how much of the fit is used, by how much it explains
+};
+RoomFit sRoomFit;
+
+static void room_fit_tick() noexcept {
+  auto& f = sRoomFit;
+  if (const u32 epoch = gfx::xr_room_fit_epoch(); epoch != f.epoch) {
+    const u32 gen = f.gen + 1;
+    f = {};
+    f.epoch = epoch;
+    f.gen = gen;
+    return;
+  }
+  if (f.frozen || f.verts == 0 || g_gxState.frameSerial - f.lastAdd < 30)
+    return;
+  f.frozen = true;
+  // Normal equations, a little ridge on the directional terms.
+  double m[4][5];
+  for (int i = 0; i < 4; ++i) {
+    for (int j = 0; j < 4; ++j)
+      m[i][j] = f.ata[i][j] + (i == j && i > 0 ? 1e-3 * f.ata[0][0] : 0.0);
+    m[i][4] = f.atb[i];
+  }
+  for (int i = 0; i < 4; ++i) {
+    int piv = i;
+    for (int r = i + 1; r < 4; ++r)
+      if (std::abs(m[r][i]) > std::abs(m[piv][i]))
+        piv = r;
+    if (!(std::abs(m[piv][i]) > 1e-12))
+      return;
+    std::swap(m[i], m[piv]);
+    for (int r = 0; r < 4; ++r) {
+      if (r == i)
+        continue;
+      const double k = m[r][i] / m[i][i];
+      for (int j = i; j < 5; ++j)
+        m[r][j] -= k * m[i][j];
+    }
+  }
+  double c[4];
+  for (int i = 0; i < 4; ++i)
+    c[i] = m[i][4] / m[i][i];
+  double sse = f.btb;
+  for (int i = 0; i < 4; ++i) {
+    sse -= 2.0 * c[i] * f.atb[i];
+    for (int j = 0; j < 4; ++j)
+      sse += c[i] * f.ata[i][j] * c[j];
+  }
+  const double sst = f.btb - f.atb[0] * f.atb[0] / f.ata[0][0];
+  for (int i = 0; i < 4; ++i)
+    f.c[i] = static_cast<float>(c[i]);
+  static const bool use = [] {
+    const char* v = std::getenv("AURORA_XR_ROOM_FIT");
+    return v == nullptr || *v != '0';
+  }();
+  // A fit that explains little is mostly the stage's colours varying with
+  // where they face, not light (Peach's Castle, R2 0.11): none of it under
+  // 0.15, all of it from 0.45 (Pokemon Stadium, 0.44).
+  const double r2 = sst > 0.0 ? 1.0 - sse / sst : 0.0;
+  f.trust = std::clamp(static_cast<float>((r2 - 0.15) / 0.3), 0.f, 1.f);
+  f.valid = use && f.c[0] + f.c[2] > 0.02f && f.trust > 0.f;
+  ++f.gen;
+  Log.info("XR room fit: {} draws, {} vertices: luminance {:.3f} {:+.3f} x {:+.3f} y {:+.3f} z (up {:.3f}, down {:.3f}, "
+           "side {:.3f}), R2 {:.2f}, used {:.0f}%",
+           f.draws, f.verts, c[0], c[1], c[2], c[3], c[0] + c[2], c[0] - c[2], c[0], r2, f.valid ? f.trust * 100.f : 0.f);
+}
+
 // XR room lighting's SMOOTH shading (kDecodedXrNrm): each vertex's normal,
 // in model space, from the draw's own triangles. Vertices at the same place
 // (same position and matrix) are one point, and a vertex takes the faces
 // around its point within the crease angle (AURORA_XR_ROOM_CREASE, degrees,
 // default 50) of the faces it's a corner of, weighted by area: a curved
-// surface shades smoothly, a corner stays sharp. Which side a normal points
-// doesn't matter (the shader turns it toward the eye), so faces are summed
-// turned to agree, and a mesh's mixed windings don't cancel. Made on a
-// decode cache miss only; a draw's own triangles only (seams between draws
-// keep a crease).
-static void smooth_normals(const DecodedLayout& layout, u16 vtxCount, u8* base, u8 nrmOffset) noexcept {
+// surface shades smoothly, a corner stays sharp. Faces are summed turned to
+// agree, so a mesh's mixed windings don't cancel; the sum is then turned
+// outward by the winding of the vertex's own faces (front faces clockwise
+// on screen, GX's). Made on a decode cache miss only; a draw's own
+// triangles only (seams between draws keep a crease). In w, the vertex's
+// de-light factor (RoomFit), 1 where its draw isn't lit by vertex colours.
+static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layout, u16 vtxCount, u8* base,
+                           u8 nrmOffset) noexcept {
   static const float cosCrease = [] {
     const char* v = std::getenv("AURORA_XR_ROOM_CREASE");
     const float deg = v != nullptr ? std::strtof(v, nullptr) : 50.f;
     return std::cos(std::clamp(deg, 0.f, 180.f) * 0.017453292f);
   }();
+  // The faces' outward side, as wound: against the cross product of their
+  // edges (seen on desktop: tops point up, walls toward their front).
+  constexpr float outward = -1.f;
   using V3 = std::array<float, 3>;
-  int posOffset = -1, mtxOffset = -1;
+  int posOffset = -1, mtxOffset = -1, clrOffset = -1;
   for (u8 i = 0; i < layout.count; ++i) {
     if (layout.attrs[i].attr == GX_VA_POS)
       posOffset = layout.attrs[i].offset;
     else if (layout.attrs[i].attr == GX_VA_PNMTXIDX)
       mtxOffset = layout.attrs[i].offset;
+    else if (layout.attrs[i].attr == GX_VA_CLR0)
+      clrOffset = layout.attrs[i].offset;
   }
   const auto at = [&](u32 v, int offset) { return base + static_cast<size_t>(v) * layout.stride + offset; };
-  for (u32 v = 0; v < vtxCount; ++v)
-    std::memset(at(v, nrmOffset), 0, 12);
+  for (u32 v = 0; v < vtxCount; ++v) {
+    constexpr float none[4] = {0.f, 0.f, 0.f, 1.f};
+    std::memcpy(at(v, nrmOffset), none, 16);
+  }
   if (posOffset < 0 || vtxCount < 3)
     return;
-  static std::vector<V3> pos, area, unit, ref;
+  static std::vector<V3> pos, area, unit, ref, wound;
+  static std::vector<float> weight;
   static std::vector<std::array<u16, 3>> tris;
   static std::vector<u32> group, first, faces;
   static std::unordered_map<u64, u32> points;
@@ -556,7 +650,7 @@ static void smooth_normals(const DecodedLayout& layout, u16 vtxCount, u8* base, 
       std::memcpy(&key[3], at(v, mtxOffset), 4);
     group[v] = points.try_emplace(XXH3_64bits(key, sizeof(key)), static_cast<u32>(points.size())).first->second;
   }
-  // The triangles, as prepare_idx_buffer makes them.
+  // The triangles, as prepare_idx_buffer makes them (its windings).
   tris.clear();
   const auto prim = static_cast<GXPrimitive>(sDrawPrim);
   if (prim == GX_QUADS) {
@@ -567,23 +661,31 @@ static void smooth_normals(const DecodedLayout& layout, u16 vtxCount, u8* base, 
   } else if (prim == GX_TRIANGLES) {
     for (u32 v = 0; v + 2 < vtxCount; v += 3)
       tris.push_back({u16(v), u16(v + 1), u16(v + 2)});
-  } else if (prim == GX_TRIANGLESTRIP || prim == GX_TRIANGLEFAN) {
+  } else if (prim == GX_TRIANGLEFAN) {
     for (u32 v = 2; v < vtxCount; ++v)
-      tris.push_back({u16(prim == GX_TRIANGLEFAN ? 0 : v - 2), u16(v - 1), u16(v)});
+      tris.push_back({0, u16(v - 1), u16(v)});
+  } else if (prim == GX_TRIANGLESTRIP) {
+    for (u32 v = 2; v < vtxCount; ++v)
+      tris.push_back((v & 1) == 0 ? std::array<u16, 3>{u16(v - 2), u16(v - 1), u16(v)}
+                                   : std::array<u16, 3>{u16(v - 1), u16(v - 2), u16(v)});
   }
   const auto sub = [](const V3& a, const V3& b) { return V3{a[0] - b[0], a[1] - b[1], a[2] - b[2]}; };
   const auto dot = [](const V3& a, const V3& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+  const auto cross = [](const V3& a, const V3& b) {
+    return V3{a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+  };
   // Each face's normal (its length twice its area) and unit normal; faces by
-  // point (CSR: first[g] .. first[g + 1]); each vertex's own faces, summed.
+  // point (CSR: first[g] .. first[g + 1]); each vertex's own faces, summed
+  // turned to agree (ref) and as wound (wound).
   const size_t n = tris.size();
   area.resize(n);
   unit.resize(n);
   ref.assign(vtxCount, V3{});
+  wound.assign(vtxCount, V3{});
   first.assign(points.size() + 1, 0);
   for (size_t t = 0; t < n; ++t) {
     const auto& [a, b, c] = tris[t];
-    const V3 e1 = sub(pos[b], pos[a]), e2 = sub(pos[c], pos[a]);
-    area[t] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    area[t] = cross(sub(pos[b], pos[a]), sub(pos[c], pos[a]));
     const float len = std::sqrt(dot(area[t], area[t]));
     if (!(len > 1e-20f) || group[a] == group[b] || group[b] == group[c] || group[a] == group[c]) {
       unit[t] = {};
@@ -593,8 +695,10 @@ static void smooth_normals(const DecodedLayout& layout, u16 vtxCount, u8* base, 
     for (const u16 v : tris[t]) {
       ++first[group[v] + 1];
       const float s = dot(ref[v], unit[t]) < 0.f ? -1.f : 1.f;
-      for (int k = 0; k < 3; ++k)
+      for (int k = 0; k < 3; ++k) {
         ref[v][k] += s * unit[t][k];
+        wound[v][k] += area[t][k];
+      }
     }
   }
   for (size_t g = 0; g < points.size(); ++g)
@@ -607,6 +711,51 @@ static void smooth_normals(const DecodedLayout& layout, u16 vtxCount, u8* base, 
       if (unit[t][0] != 0.f || unit[t][1] != 0.f || unit[t][2] != 0.f)
         for (const u16 v : tris[t])
           faces[fill[group[v]]++] = static_cast<u32>(t);
+  }
+  // The fit's part: a stage draw lit by its vertex colours (as the census
+  // tells them), with the game's view to take normals to the world.
+  const auto& cfg = sDrawCache.config;
+  bool ras = false;
+  for (u32 i = 0; i < config.tevStageCount; ++i) {
+    const auto& st = config.tevStages[i];
+    for (const auto arg : {st.colorPass.a, st.colorPass.b, st.colorPass.c, st.colorPass.d})
+      ras |= arg == GX_CC_RASC || arg == GX_CC_RASA;
+  }
+  const auto& cc = config.colorChannels[0];
+  const float* view = gfx::xr_world_view();
+  auto& fit = sRoomFit;
+  const bool baked = ras && clrOffset >= 0 && cc.matSrc == GX_SRC_VTX && !cc.lightingEnabled && view != nullptr &&
+                     !(cfg.blendMode == GX_BM_BLEND && cfg.blendFacDst == GX_BL_ONE);
+  const bool accumulate = baked && !fit.frozen;
+  const bool delight = baked && fit.frozen && fit.valid;
+  const float up = fit.c[0] + fit.c[2];
+  // Model space to the world, per position matrix: its cofactors (normals
+  // and areas), then the view's inverse rotation (its transpose).
+  const auto to_world = [&](u32 v, const V3& nm) {
+    u32 mtx = g_gxState.currentPnMtx;
+    if (mtxOffset >= 0) {
+      u32 raw;
+      std::memcpy(&raw, at(v, mtxOffset), 4);
+      mtx = raw / 3u;
+    }
+    const f32* m = reinterpret_cast<const f32*>(&g_gxState.pnMtx[std::min<u32>(mtx, MaxPnMtx - 1)].pos);
+    const V3 r0{m[0], m[1], m[2]}, r1{m[4], m[5], m[6]}, r2{m[8], m[9], m[10]};
+    const V3 cam{dot(cross(r1, r2), nm), dot(cross(r2, r0), nm), dot(cross(r0, r1), nm)};
+    return V3{cam[0] * view[0] + cam[1] * view[4] + cam[2] * view[8],
+              cam[0] * view[1] + cam[1] * view[5] + cam[2] * view[9],
+              cam[0] * view[2] + cam[1] * view[6] + cam[2] * view[10]};
+  };
+  if (accumulate) {
+    weight.assign(vtxCount, 0.f);
+    for (size_t t = 0; t < n; ++t)
+      if (unit[t][0] != 0.f || unit[t][1] != 0.f || unit[t][2] != 0.f) {
+        const V3 w = to_world(tris[t][0], area[t]);
+        const float a3 = std::sqrt(dot(w, w)) / 6.f;
+        for (const u16 v : tris[t])
+          weight[v] += a3;
+      }
+    ++fit.draws;
+    fit.lastAdd = g_gxState.frameSerial;
   }
   for (u32 v = 0; v < vtxCount; ++v) {
     const float rl = std::sqrt(dot(ref[v], ref[v]));
@@ -626,8 +775,35 @@ static void smooth_normals(const DecodedLayout& layout, u16 vtxCount, u8* base, 
     const float sl = std::sqrt(dot(sum, sum));
     if (!(sl > 1e-30f))
       continue;
-    const V3 out{sum[0] / sl, sum[1] / sl, sum[2] / sl};
-    std::memcpy(at(v, nrmOffset), out.data(), 12);
+    const float s = (dot(sum, wound[v]) < 0.f ? -1.f : 1.f) * outward / sl;
+    float out[4] = {sum[0] * s, sum[1] * s, sum[2] * s, 1.f};
+    if (accumulate || delight) {
+      V3 w = to_world(v, {out[0], out[1], out[2]});
+      const float wl = std::sqrt(dot(w, w));
+      if (wl > 1e-20f) {
+        w = {w[0] / wl, w[1] / wl, w[2] / wl};
+        if (accumulate && weight[v] > 0.f) {
+          float clr[4];
+          std::memcpy(clr, at(v, clrOffset), 16);
+          const double lum = 0.2126 * clr[0] + 0.7152 * clr[1] + 0.0722 * clr[2];
+          const double basis[4] = {1.0, w[0], w[1], w[2]}, wt = weight[v];
+          for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j)
+              fit.ata[i][j] += wt * basis[i] * basis[j];
+            fit.atb[i] += wt * basis[i] * lum;
+          }
+          fit.btb += wt * lum * lum;
+          ++fit.verts;
+        }
+        if (delight) {
+          const float at_n = fit.c[0] + fit.c[1] * w[0] + fit.c[2] * w[1] + fit.c[3] * w[2];
+          // Within a factor of 2: the plane fits a bake's falloff loosely
+          // at its far side (Pokemon Stadium's undersides blew out at 4).
+          out[3] = 1.f + (std::clamp(up / std::max(at_n, 1e-3f), 0.5f, 2.f) - 1.f) * fit.trust;
+        }
+      }
+    }
+    std::memcpy(at(v, nrmOffset), out, 16);
   }
 }
 
@@ -705,7 +881,7 @@ static void decode_vertices(const ShaderConfig& config, const DecodedLayout& lay
     }
   }
   if (smoothOffset >= 0)
-    smooth_normals(layout, vtxCount, base, static_cast<u8>(smoothOffset));
+    smooth_normals(config, layout, vtxCount, base, static_cast<u8>(smoothOffset));
 }
 
 // Decoded vertices kept across frames (AURORA_VTX_CACHE, default on with the
@@ -801,6 +977,7 @@ DecodeKey decode_key(const ShaderConfig& config, const u8* raw, u16 vtxCount) no
     std::array<u32, GX_VA_TEX7 - GX_VA_POS + 1> sizes{};
     u32 vtxCount = 0;
     u8 vtxStride = 0, decodedAll = 0, decodedPos = 0, pad = 0;
+    u32 fit = 0;
   } parts;
   parts.raw = XXH3_64bits(raw, static_cast<size_t>(vtxCount) * config.vtxStride);
   // The formats change only with the vertex format: hashed when they do.
@@ -823,6 +1000,7 @@ DecodeKey decode_key(const ShaderConfig& config, const u8* raw, u16 vtxCount) no
   parts.decodedAll = config.decodedAll;
   parts.decodedPos = config.decodedPos;
   parts.pad = config.xrSmoothNrm ? sDrawPrim : 0; // the smooth normals' triangles
+  parts.fit = config.xrSmoothNrm ? sRoomFit.gen : 0; // and de-light factors
   const XXH128_hash_t h = XXH3_128bits(&parts, sizeof(parts));
   return {h.low64, h.high64};
 }
@@ -1151,6 +1329,7 @@ static u8 xr_room_class() noexcept {
 // a stage triangle draw without its own normals, its every attribute
 // decoded, with room for one more.
 static bool xr_room_smooth(const ShaderConfig& sc) noexcept {
+  room_fit_tick();
   if ((gfx::xr_room_light() & 32u) == 0 || xr_room_class() != 2 || !sc.decodedAll || sc.lineMode != 0 ||
       sDrawPrim == 0 || sc.attrs[GX_VA_NRM].attrType != GX_NONE)
     return false;
