@@ -512,6 +512,12 @@ static DecodedLayout decode_layout_for(const ShaderConfig& config) noexcept {
 // (GX_AURORA_DRAW_INDEXED), which gets none.
 u8 sDrawPrim = 0;
 
+// An additive draw (glows, fire, lasers, screens' light): light of its own,
+// which the room doesn't light.
+static bool xr_additive(const PipelineConfig& c) noexcept {
+  return c.blendMode == GX_BM_BLEND && c.blendFacDst == GX_BL_ONE;
+}
+
 // XR room lighting's fit of the stage's baked light (SMOOTH shading): the
 // luminance of the vertex colours the stage's unlit draws are lit by, as a
 // function of the outward normal in the stage's world, c0 + c1 x + c2 y +
@@ -725,7 +731,7 @@ static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layo
   const float* view = gfx::xr_world_view();
   auto& fit = sRoomFit;
   const bool baked = ras && clrOffset >= 0 && cc.matSrc == GX_SRC_VTX && !cc.lightingEnabled && view != nullptr &&
-                     !(cfg.blendMode == GX_BM_BLEND && cfg.blendFacDst == GX_BL_ONE);
+                     !xr_additive(cfg);
   const bool accumulate = baked && !fit.frozen;
   const bool delight = baked && fit.frozen && fit.valid;
   const float up = fit.c[0] + fit.c[2];
@@ -1319,7 +1325,7 @@ static XrClipClass classify_xr_clip(const ShaderConfig& config, const u8* raw, u
 // stage (links 0 to 4), 0 anything else (effects, the HUD, unmarked draws).
 // 0 too while the room light is off.
 static u8 xr_room_class() noexcept {
-  if (gfx::xr_room_light() == 0 || sLinkTag == 0)
+  if (gfx::xr_room_light() == 0 || sLinkTag == 0 || xr_additive(sDrawCache.config))
     return 0;
   const u32 link = sLinkTag - 1;
   return link == 5 || link == 6 ? 1 : link <= 4 ? 2 : 0;
@@ -1358,7 +1364,7 @@ static void xr_room_census(u16 vtxCount) noexcept {
     tex |= st.texMapId != GX_TEXMAP_NULL;
   }
   const auto& cc = sc.colorChannels[0];
-  const bool additive = c.blendMode == GX_BM_BLEND && c.blendFacDst == GX_BL_ONE;
+  const bool additive = xr_additive(c);
   const bool nrm = sc.attrs[GX_VA_NRM].attrType != GX_NONE;
   const bool vtxClr = cc.matSrc == GX_SRC_VTX && sc.attrs[GX_VA_CLR0].attrType != GX_NONE;
   enum { Additive, LitNrm, LitNoNrm, UnlitVtx, UnlitConst, UnlitTex, Other, Kinds };
