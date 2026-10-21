@@ -6123,8 +6123,12 @@ struct RoomLight {
   int shading = 0; // 0 per vertex, 1 per pixel, 2 per pixel with facet normals where meshes have none, 3 smooth ones
   int view = 0;
   float delight = 1.f;
-  float gloss = 0.5f; // the room's specular highlight: fighters, and the stage by stage_gloss
+  float gloss = 1.f; // the room's specular highlight: fighters by kFighterGloss, the stage by stage_gloss
 };
+
+// The fighters' share of GLOSS (tuned on the headset: at 1 they looked too
+// shiny; the stages' metal didn't).
+constexpr float kFighterGloss = 0.5f;
 
 // The current stage (GrKind, aurora_xr_set_stage), for stage_gloss.
 std::atomic<int> g_roomStage{-1};
@@ -6709,7 +6713,7 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   f.on = true;
   f.w[0] = r.fighters, f.w[1] = r.stage, f.w[2] = r.unlit;
   f.delight = r.delight;
-  f.gloss[0] = r.gloss;
+  f.gloss[0] = r.gloss * kFighterGloss;
   f.gloss[1] = r.gloss * stage_gloss(g_roomStage);
   for (int k = 0; k < 9; ++k)
     for (int c = 0; c < 3; ++c)
