@@ -6171,10 +6171,10 @@ struct {
 // degrees apart, by their excess over the mean (the shader's key and fill;
 // a window and a ceiling light both count), the rest as SH L2 as the
 // presets' (room_sh), unseen cells filled from their hemisphere's seen
-// ones. Its level is the room's as passthrough shows it: an up-facing
-// surface's light in the frames' own pixel scale (the relative radiance
+// ones. Its level is the room's as passthrough shows it: the seen room's
+// median brightness in the frames' own pixel scale (the relative radiance
 // times the capture's median exposure times sensitivity, undoing what auto
-// exposure took out), by kCapDisplay, is the level (ABL). In room_frame the
+// exposure took out), by kCapMedian, is the level (ABL). In room_frame the
 // stage's unlit draws take it from above (their tops the baked colour times
 // the level, times STRENGTH), and the fighters as the room's mean light
 // over every direction (kCapFighters times the level): a backlit room
@@ -6182,17 +6182,15 @@ struct {
 constexpr int kCapN = 8, kCapSub = 3, kCapF = kCapN * kCapSub;
 constexpr int kCapCells = 6 * kCapN * kCapN, kCapParts = 6 * kCapF * kCapF;
 constexpr int64_t kCaptureNs = 20'000'000'000;
-// The level per unit of passthrough brightness (T4 found the camera's mean
-// linear luminance about 0.16 in a room the stage looked right in, and the
-// user had matched one at 0.75): confirmed on the headset, a capture there
-// measured 0.147, a level of 0.74, and STRENGTH 1 looked right. And the
-// fighters' mean light at level 1.
-constexpr float kCapDisplay = 5.f;
+// The fighters' mean light at level 1.
 constexpr float kCapFighters = 0.7f;
-// The level's floor from the seen room's mean brightness, against the
-// light from above (provisional: 1, a surface lit as bright as the room
-// looks on average).
-constexpr float kCapSeenShare = 1.f;
+// The level per unit of the seen room's median brightness (by solid angle,
+// in passthrough's scale). Passthrough's up moved the level 3x on whether
+// the camera caught the ceiling light (2026-10-21: up 0.115 and level 0.58,
+// too dark, looking ahead; 0.33-0.40 and 1.25, overlit, with the light in
+// view), the room the same. The walls' median hardly moves with a fixture
+// in or out of view (provisional: 12, calibrated against one capture of each).
+constexpr float kCapMedian = 12.f;
 constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
 // Ambient capture: each part a running mean of about its last 600 samples.
 constexpr double kCapPartMax = 600.0;
@@ -6234,7 +6232,8 @@ struct {
   std::array<std::array<float, 3>, 2> lightPos{}; // where
   std::array<int, 2> lightHits{};                // from how many hits
   float mean = 1.f, display = 0.f, level = 1.f; // mean light (up 1), passthrough's up, level
-  float seen = 0.f; // the seen parts' mean luminance, in passthrough's scale (as display)
+  float seen = 0.f;   // the seen parts' mean luminance, in passthrough's scale (as display)
+  float middle = 0.f; // and their median by solid angle
   // The light last made from them (made: any).
   bool made = false;
   std::array<std::array<float, 3>, 9> sh{};
@@ -6288,6 +6287,7 @@ void capture_make() {
   std::vector<bool> partSeen(kCapParts);
   std::array<double, 3> hemi[2]{};
   double hemiW[2]{}, seenW = 0.0, seenLum = 0.0;
+  std::vector<std::pair<double, double>> byLum; // the seen parts' luminance and solid angle
   for (int f = 0; f < kCapParts; ++f) {
     const auto& e = c.parts[f];
     if (!(e[3] + e[7] > 0.0))
@@ -6302,7 +6302,9 @@ void capture_make() {
     }
     hemiW[h] += dw;
     seenW += dw;
-    seenLum += (0.2126 * P[f][0] + 0.7152 * P[f][1] + 0.0722 * P[f][2]) * dw;
+    const double lum = 0.2126 * P[f][0] + 0.7152 * P[f][1] + 0.0722 * P[f][2];
+    seenLum += lum * dw;
+    byLum.emplace_back(lum, dw);
   }
   if (!(seenW > 0.0))
     return;
@@ -6413,9 +6415,18 @@ void capture_make() {
   }
   c.display = static_cast<float>(upLum * median);
   c.seen = static_cast<float>(seenLum / seenW * median);
-  // A light the camera missed (above its view) still lights the walls it
-  // saw: the room as seen keeps the level up (kCapSeenShare).
-  c.level = std::clamp(kCapDisplay * std::max(c.display, kCapSeenShare * c.seen), 0.15f, 1.25f);
+  std::sort(byLum.begin(), byLum.end());
+  double half = 0.5 * seenW, middle = byLum.back().first;
+  for (const auto& [lum, dw] : byLum)
+    if ((half -= dw) <= 0.0) {
+      middle = lum;
+      break;
+    }
+  c.middle = static_cast<float>(middle * median);
+  // The level from the walls as seen, not from above: a light in or out of
+  // the camera's view (it sees ~36 degrees up and down) moves the light
+  // from above 3x, the room the same.
+  c.level = std::clamp(kCapMedian * c.middle, 0.15f, 1.25f);
   c.mean = static_cast<float>((0.2126 * sh[0][0] + 0.7152 * sh[0][1] + 0.0722 * sh[0][2] +
                                0.25 * (lum_of(light[0]) + lum_of(light[1]))) * scale);
   for (int k = 0; k < 9; ++k)
@@ -11201,7 +11212,7 @@ void capture_log(const char* what, uint32_t frames) {
   auto& c = g_capture;
   Log.info("Room capture{}: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
            "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} (placed: {}, {}; {} casts, {} hits kept, {} and {} "
-           "near the lights); passthrough's up {:.4f}, seen {:.4f}, level {:.2f}; "
+           "near the lights); passthrough's up {:.4f}, seen {:.4f}, median {:.4f}, level {:.2f} ({:.2f} unclamped); "
            "brightest cells (room x,y,z; times the mean):{}",
            what, frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
            c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
@@ -11210,7 +11221,8 @@ void capture_log(const char* what, uint32_t frames) {
                         : "no",
            c.lightAt[1] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[1][0], c.lightPos[1][1], c.lightPos[1][2])
                         : "no",
-           c.casts, c.hits.size(), c.lightHits[0], c.lightHits[1], c.display, c.seen, c.level, capture_brightest());
+           c.casts, c.hits.size(), c.lightHits[0], c.lightHits[1], c.display, c.seen, c.middle, c.level,
+           kCapMedian * c.middle, capture_brightest());
 }
 
 // XR thread, every frame: whether ambient capture may run (the menus, or
