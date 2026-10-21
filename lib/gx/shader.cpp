@@ -2224,6 +2224,24 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
                                                  : "\n    prev = vec4f(vec3f(0.5), prev.a);");
   }
 
+  // A stage draw whose TEV colour never reads a colour channel (textures or
+  // constant colours alone: FD's floor, much of Battlefield and Brinstar)
+  // has nowhere for xr_room_mix's light to go: the room's unlit light, as
+  // xr_room_mix gives an unlit channel, multiplies its final colour instead
+  // (before the debug views).
+  bool xrReadsRas = false;
+  for (u32 i = 0; i < config.tevStageCount; ++i) {
+    const auto& cp = config.tevStages[i].colorPass;
+    for (const auto arg : {cp.a, cp.b, cp.c, cp.d})
+      xrReadsRas |= arg == GX_CC_RASC || arg == GX_CC_RASA;
+  }
+  if (xrRoom && config.xrRoom == 2 && !xrReadsRas) {
+    const std::string room = config.xrRoomFacet && xrRoomNrmPx == "xr_n"sv
+                                 ? "xr_room_diffuse(xr_n) * (xr.room_w.w * xr_dl)"s
+                                 : "xr.room_up.rgb"s;
+    fragReturn.insert(0, fmt::format("\n    prev = vec4f(prev.rgb * mix(vec3f(1.0), {}, xr.room_w.z), prev.a);", room));
+  }
+
   /* Byte/half-word unpacking has no form every mobile compiler accepts:
    * PowerVR Rogue miscompiles extractBits on storage-buffer reads (vertex
    * explosions, Galaxy A04), while Adreno 750's compiler fails to link most
