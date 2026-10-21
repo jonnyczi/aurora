@@ -6123,7 +6123,27 @@ struct RoomLight {
   int shading = 0; // 0 per vertex, 1 per pixel, 2 per pixel with facet normals where meshes have none, 3 smooth ones
   int view = 0;
   float delight = 1.f;
+  float gloss = 0.3f; // the room's specular highlight: fighters, and the stage by stage_gloss
 };
+
+// The current stage (GrKind, aurora_xr_set_stage), for stage_gloss.
+std::atomic<int> g_roomStage{-1};
+
+// How glossy a stage's own surfaces are (times GLOSS): the metal ones, and
+// the cars of the F-Zero stages; 0 elsewhere (no highlight pipelines).
+float stage_gloss(int grkind) {
+  switch (grkind) {
+  case 0x0E: // Corneria: the Great Fox
+  case 0x0F: // Venom
+    return 1.f;
+  case 0x12: // Mute City
+  case 0x13: // Big Blue
+  case 0x22: // Big Blue's route
+    return 0.6f;
+  default:
+    return 0.f;
+  }
+}
 
 struct {
   std::mutex mutex;
@@ -6603,15 +6623,16 @@ std::array<std::array<float, 3>, 9> room_sh(const RoomPreset& p) {
 }
 
 std::string room_light_value(const RoomLight& r) {
-  return fmt::format("{},{:.2f},{:.2f},{:.2f},{:.2f},{:.0f},{},{},{:.2f}", r.source, r.fighters, r.stage, r.unlit,
-                     r.strength, r.yaw, r.shading, r.view, r.delight);
+  return fmt::format("{},{:.2f},{:.2f},{:.2f},{:.2f},{:.0f},{},{},{:.2f},{:.2f}", r.source, r.fighters, r.stage,
+                     r.unlit, r.strength, r.yaw, r.shading, r.view, r.delight, r.gloss);
 }
 
 // The eye pipelines' variant bits (gfx::set_xr_room_light).
 void room_light_apply(const RoomLight& r) {
   gfx::set_xr_room_light(r.source == 0 ? 0u
                                          : 1u | (r.shading == 1 ? 2u : 0u) | (static_cast<uint32_t>(r.view) & 3u) << 2 |
-                                               (r.shading >= 2 ? 16u : 0u) | (r.shading == 3 ? 32u : 0u));
+                                               (r.shading >= 2 ? 16u : 0u) | (r.shading == 3 ? 32u : 0u) |
+                                               (r.gloss > 0.f && stage_gloss(g_roomStage) > 0.f ? 64u : 0u));
 }
 
 void init_room_light() {
@@ -6620,8 +6641,9 @@ void init_room_light() {
     g_room.sh[i] = room_sh(kRoomPresets[i]);
   RoomLight r;
   if (const char* v = std::getenv("AURORA_XR_ROOM_LIGHT")) {
-    float f[9] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f, r.delight};
-    std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7], &f[8]);
+    float f[10] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f, r.delight, r.gloss};
+    std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7], &f[8],
+                &f[9]);
     r.source = std::clamp(static_cast<int>(f[0]), 0, kRoomSourceCaptured);
     r.fighters = std::clamp(f[1], 0.f, 1.f);
     r.stage = std::clamp(f[2], 0.f, 1.f);
@@ -6631,6 +6653,7 @@ void init_room_light() {
     r.shading = std::clamp(static_cast<int>(f[6]), 0, 3);
     r.view = std::clamp(static_cast<int>(f[7]), 0, 3);
     r.delight = std::clamp(f[8], 0.f, 1.f);
+    r.gloss = std::clamp(f[9], 0.f, 1.f);
     Log.info("Room light: AURORA_XR_ROOM_LIGHT={}", room_light_value(r));
   }
   if (r.source == kRoomSourceCaptured)
@@ -6647,6 +6670,7 @@ struct RoomFrame {
   std::array<float, 3> dir[2]{}; // in the room
   float col[2][4]{};
   float delight = 0.f;
+  float gloss[2]{}; // fighters', the stage's
 };
 
 // `arena`: the stage's placement (its rotation about y and scale).
@@ -6676,6 +6700,8 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   f.on = true;
   f.w[0] = r.fighters, f.w[1] = r.stage, f.w[2] = r.unlit;
   f.delight = r.delight;
+  f.gloss[0] = r.gloss;
+  f.gloss[1] = r.gloss * stage_gloss(g_roomStage);
   for (int k = 0; k < 9; ++k)
     for (int c = 0; c < 3; ++c)
       f.sh[k][c] = sh[k][c] * gain;
@@ -6897,10 +6923,22 @@ constexpr std::array<Rgba, AURORA_XR_MIX_BANDS> kBandColors{Rgba{255, 170, 80, 2
                                                             Rgba{190, 150, 255, 255}};
 
 // The Light page (room lighting): a row each, choices or sliders.
-enum { kRlSource, kRlFighters, kRlStage, kRlUnlit, kRlDelight, kRlStrength, kRlYaw, kRlShading, kRlView, kRlRows };
-constexpr int kLightRowY0 = 70, kLightRowStep = 44;
-constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE",   "FIGHTERS", "STAGE",   "UNLIT", "DELIGHT",
-                                                       "STRENGTH", "YAW",      "SHADING", "VIEW"};
+enum {
+  kRlSource,
+  kRlFighters,
+  kRlStage,
+  kRlUnlit,
+  kRlDelight,
+  kRlGloss,
+  kRlStrength,
+  kRlYaw,
+  kRlShading,
+  kRlView,
+  kRlRows
+};
+constexpr int kLightRowY0 = 70, kLightRowStep = 40;
+constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE", "FIGHTERS", "STAGE", "UNLIT",   "DELIGHT",
+                                                       "GLOSS",  "STRENGTH", "YAW",   "SHADING", "VIEW"};
 constexpr std::array<const char*, 4> kShadingNames{"VERTEX", "PIXEL", "FACET", "SMOOTH"};
 constexpr std::array<const char*, 4> kViewNames{"OFF", "LIT", "CLASS", "NORMALS"};
 
@@ -7294,6 +7332,7 @@ float light_max(int row) { return row == kRlStrength ? 2.f : row == kRlYaw ? 360
 float& light_slider(RoomLight& r, int row) {
   return row == kRlFighters ? r.fighters : row == kRlStage ? r.stage : row == kRlUnlit ? r.unlit
                                          : row == kRlDelight  ? r.delight
+                                         : row == kRlGloss    ? r.gloss
                                          : row == kRlStrength ? r.strength : r.yaw;
 }
 
@@ -9042,7 +9081,8 @@ static_assert(gfx::XrMaxClipPlanes == AURORA_XR_MAX_CLIPS && gfx::XrMaxClipPlane
 // game camera space), then last frame's own (from last frame's).
 // Then the room light's fields (shader.cpp's XrEye: room_m to room_col).
 constexpr uint64_t kMultiviewEyeSize =
-    2 * 64 + 16 + gfx::XrMaxClipPlanes * 16 + gfx::XrMaxClipPlanes * 4 + 4 * 64 + 64 + 4 * 16 + 9 * 16 + 4 * 16;
+    2 * 64 + 16 + gfx::XrMaxClipPlanes * 16 + gfx::XrMaxClipPlanes * 4 + 4 * 64 + 64 + 4 * 16 + 9 * 16 + 4 * 16 +
+    2 * 16;
 
 struct Renderer3D {
   uint64_t layoutKey = 0;
@@ -10265,6 +10305,9 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
     float roomW[4], roomUp[4], roomL[4], roomH[4];
     float roomSh[9][4];
     float roomDir[2][4], roomCol[2][4];
+    // Each eye in game camera space (the highlight's view vector); w: the
+    // fighters' gloss, then the stage's.
+    float roomEye[2][4];
   } mv[gfx::XrMaxTransforms]{};
   static_assert(sizeof(mv[0]) == kMultiviewEyeSize);
   std::array<Mat4, gfx::XrMaxTransforms> worldToRoom{}, cameraToRoom{};
@@ -10381,6 +10424,14 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
           u.roomH[c] = hl > 1e-12f ? h[c] / hl : 0.f;
         }
         u.roomH[3] = room.delight;
+        const Mat4 toCamera = inverse_affine({m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]});
+        for (int eye = 0; eye < 2; ++eye) {
+          const XrVector3f p = views[eye].pose.position;
+          for (int c = 0; c < 3; ++c)
+            u.roomEye[eye][c] = toCamera[c * 4] * p.x + toCamera[c * 4 + 1] * p.y + toCamera[c * 4 + 2] * p.z +
+                                toCamera[c * 4 + 3];
+          u.roomEye[eye][3] = room.gloss[eye];
+        }
       }
     for (size_t t = 0; t < transforms; ++t)
       webgpu::g_queue.WriteBuffer(R.mvUniforms[t], 0, &mv[t], sizeof(mv[t]));
@@ -11361,6 +11412,15 @@ extern "C" void aurora_xr_set_stage(int stage, float x, float y, float z, float 
     g_grade.stage = stage;
   }
   aurora_xr_set_room_grade(1.f, 1.f, 1.f, 1.f);
+  g_roomStage = stage;
+  {
+    RoomLight r;
+    {
+      std::lock_guard lock{g_room.mutex};
+      r = g_room.value;
+    }
+    room_light_apply(r); // the stage's gloss pipelines or none
+  }
   std::lock_guard lock{g_arenaMutex};
   g_stage = stage;
   g_arenaCenter = {x, y, z};

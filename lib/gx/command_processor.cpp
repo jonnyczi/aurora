@@ -1429,6 +1429,7 @@ static const PipelineConfig& xr_eye_config() noexcept {
     c.shaderConfig.xrRoomFacet = (room >> 4) & 1;
     c.shaderConfig.xrRoomPixel = ((room >> 1) & 1) | c.shaderConfig.xrRoomFacet;
     c.shaderConfig.xrRoomView = (room >> 2) & 3;
+    c.shaderConfig.xrRoomGloss = cls == 2 && ((room >> 6) & 1);
   }
   return c;
 }

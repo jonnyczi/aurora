@@ -1505,6 +1505,14 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
   const bool xrRoomFacetNrm = xrRoom && !xrRoomHasNrm && config.xrRoomFacet && config.lineMode == 0;
   const bool xrRoomSmoothNrm = xrRoomFacetNrm && config.xrSmoothNrm && config.decodedAll;
   const std::string_view xrRoomNrmPx = xrRoomNrmOut || xrRoomFacetNrm ? "xr_n"sv : "vec3f(0.0)"sv;
+  // The room's specular highlight (fighters; stage draws on a glossy
+  // stage): the view vector to this eye, in game camera space, where a
+  // normal per pixel is.
+  const bool xrRoomSpec = xrRoom && (config.xrRoom == 1 || config.xrRoomGloss) && (xrRoomNrmOut || xrRoomFacetNrm);
+  if (xrRoomSpec) {
+    vtxOutAttrs += fmt::format("\n    @location({}) xr_v: vec3f,", vtxOutIdx++);
+    vtxXfrAttrsPre += "\n    out.xr_v = xr.room_eye[xr_view].xyz - mv_pos;";
+  }
   if (xrRoomNrmOut) {
     vtxOutAttrs += fmt::format("\n    @location({}) xr_n: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.xr_n = mv_nrm;";
@@ -2224,6 +2232,14 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
                                                  : "\n    prev = vec4f(vec3f(0.5), prev.a);");
   }
 
+  // The room's lights' highlights, added (Blinn-Phong, normalized): the
+  // gloss in xr.room_eye[0].w (fighters) and [1].w (the stage), times the
+  // class's weight. After the room's unlit light below, before the views.
+  if (xrRoomSpec) {
+    fragReturn.insert(0, fmt::format("\n    prev = vec4f(prev.rgb + xr_room_spec(xr_n, in.xr_v, xr.room_eye[{}].w) * {}, "
+                                     "prev.a);",
+                                     config.xrRoom == 1 ? 0 : 1, config.xrRoom == 1 ? "xr.room_w.x" : "xr.room_w.y"));
+  }
   // A stage draw whose TEV colour never reads a colour channel (textures or
   // constant colours alone: FD's floor, much of Battlefield and Brinstar)
   // has nowhere for xr_room_mix's light to go: the room's unlit light, as
@@ -2642,7 +2658,8 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
       shaderSource.insert(at + anchor.size(),
                           multiview ? fmt::format("\nstruct XrEye {{ m: array<mat4x4f, {0}>, enabled: vec4u, clip: array<vec4f, 8>, fade: array<vec4f, 2>, prev: array<mat4x4f, {0}>, prev_m: array<mat4x4f, {0}>,"
                                                   " room_m: mat4x4f, room_w: vec4f, room_up: vec4f, room_l: vec4f, room_h: vec4f,"
-                                                  " room_sh: array<vec4f, 9>, room_dir: array<vec4f, 2>, room_col: array<vec4f, 2> }};"
+                                                  " room_sh: array<vec4f, 9>, room_dir: array<vec4f, 2>, room_col: array<vec4f, 2>,"
+                                                  " room_eye: array<vec4f, 2> }};"
                                                   "\n@group(3) @binding(0)\nvar<uniform> xr: XrEye;"
                                                   "\nvar<private> xr_view: u32;"
                                                   "\nvar<private> xr_cam: vec3f;"
@@ -2680,6 +2697,22 @@ fn xr_room_diffuse(n_cam: vec3f) -> vec3f {
     e += max(dot(n, xr.room_dir[0].xyz), 0.0) * xr.room_col[0].rgb;
     e += max(dot(n, xr.room_dir[1].xyz), 0.0) * xr.room_col[1].rgb;
     return clamp(e, vec3f(0.0), vec3f(1.0));
+}
+
+// The room's two lights' specular highlight on a camera-space normal, seen
+// along v (toward the eye): normalized Blinn-Phong, exponent 32, by gloss.
+fn xr_room_spec(n: vec3f, v_in: vec3f, gloss: f32) -> vec3f {
+    if (gloss <= 0.0 || dot(n, n) == 0.0) { return vec3f(0.0); }
+    let v = normalize(v_in);
+    var s = vec3f(0.0);
+    for (var i = 0u; i < 2u; i++) {
+        let l = (xr.room_m * vec4f(xr.room_dir[i].xyz, 0.0)).xyz;
+        if (dot(l, l) < 1e-30) { continue; }
+        let ln = normalize(l);
+        let h = normalize(ln + v);
+        s += pow(max(dot(n, h), 0.0), 32.0) * max(dot(n, ln), 0.0) * xr.room_col[i].rgb;
+    }
+    return s * (gloss * 5.0);
 }
 
 )""");

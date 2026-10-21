@@ -550,7 +550,10 @@ struct ShaderConfig {
    * shared. Bits of tevStageCount's word: sizeof is unchanged, and 0 is
    * every config as it was. */
   u32 xrSmoothNrm : 1 = 0;
-  u32 tevStagePad : 23 = 0;
+  /* XR room lighting: a stage draw on a glossy stage (lib/xr's per-stage
+   * gloss) takes the room's specular highlight, as fighters do. */
+  u32 xrRoomGloss : 1 = 0;
+  u32 tevStagePad : 22 = 0;
   std::array<ColorChannelConfig, MaxColorChannels> colorChannels;
   std::array<TcgConfig, MaxTexCoord> tcgs;
   AlphaCompare alphaCompare;
