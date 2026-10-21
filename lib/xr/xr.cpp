@@ -6123,7 +6123,7 @@ struct RoomLight {
   int shading = 0; // 0 per vertex, 1 per pixel, 2 per pixel with facet normals where meshes have none, 3 smooth ones
   int view = 0;
   float delight = 1.f;
-  float gloss = 0.3f; // the room's specular highlight: fighters, and the stage by stage_gloss
+  float gloss = 0.5f; // the room's specular highlight: fighters, and the stage by stage_gloss
 };
 
 // The current stage (GrKind, aurora_xr_set_stage), for stage_gloss.
@@ -6135,11 +6135,11 @@ float stage_gloss(int grkind) {
   switch (grkind) {
   case 0x0E: // Corneria: the Great Fox
   case 0x0F: // Venom
-    return 1.f;
+    return 0.6f;
   case 0x12: // Mute City
   case 0x13: // Big Blue
   case 0x22: // Big Blue's route
-    return 0.6f;
+    return 0.36f;
   default:
     return 0.f;
   }
@@ -6185,6 +6185,10 @@ constexpr int64_t kCaptureNs = 20'000'000'000;
 // fighters' mean light at level 1.
 constexpr float kCapDisplay = 5.f;
 constexpr float kCapFighters = 0.7f;
+// The level's floor from the seen room's mean brightness, against the
+// light from above (provisional: 1, a surface lit as bright as the room
+// looks on average).
+constexpr float kCapSeenShare = 1.f;
 constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
 // Ambient capture: each part a running mean of about its last 600 samples.
 constexpr double kCapPartMax = 600.0;
@@ -6226,6 +6230,7 @@ struct {
   std::array<std::array<float, 3>, 2> lightPos{}; // where
   std::array<int, 2> lightHits{};                // from how many hits
   float mean = 1.f, display = 0.f, level = 1.f; // mean light (up 1), passthrough's up, level
+  float seen = 0.f; // the seen parts' mean luminance, in passthrough's scale (as display)
   // The light last made from them (made: any).
   bool made = false;
   std::array<std::array<float, 3>, 9> sh{};
@@ -6278,7 +6283,7 @@ void capture_make() {
   std::vector<std::array<double, 3>> P(kCapParts);
   std::vector<bool> partSeen(kCapParts);
   std::array<double, 3> hemi[2]{};
-  double hemiW[2]{}, seenW = 0.0;
+  double hemiW[2]{}, seenW = 0.0, seenLum = 0.0;
   for (int f = 0; f < kCapParts; ++f) {
     const auto& e = c.parts[f];
     if (!(e[3] + e[7] > 0.0))
@@ -6293,6 +6298,7 @@ void capture_make() {
     }
     hemiW[h] += dw;
     seenW += dw;
+    seenLum += (0.2126 * P[f][0] + 0.7152 * P[f][1] + 0.0722 * P[f][2]) * dw;
   }
   if (!(seenW > 0.0))
     return;
@@ -6402,7 +6408,10 @@ void capture_make() {
     median = f[f.size() / 2];
   }
   c.display = static_cast<float>(upLum * median);
-  c.level = std::clamp(kCapDisplay * c.display, 0.15f, 1.25f);
+  c.seen = static_cast<float>(seenLum / seenW * median);
+  // A light the camera missed (above its view) still lights the walls it
+  // saw: the room as seen keeps the level up (kCapSeenShare).
+  c.level = std::clamp(kCapDisplay * std::max(c.display, kCapSeenShare * c.seen), 0.15f, 1.25f);
   c.mean = static_cast<float>((0.2126 * sh[0][0] + 0.7152 * sh[0][1] + 0.0722 * sh[0][2] +
                                0.25 * (lum_of(light[0]) + lum_of(light[1]))) * scale);
   for (int k = 0; k < 9; ++k)
@@ -11188,7 +11197,7 @@ void capture_log(const char* what, uint32_t frames) {
   auto& c = g_capture;
   Log.info("Room capture{}: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
            "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} (placed: {}, {}; {} casts, {} hits kept, {} and {} "
-           "near the lights); passthrough's up {:.4f}, level {:.2f}; "
+           "near the lights); passthrough's up {:.4f}, seen {:.4f}, level {:.2f}; "
            "brightest cells (room x,y,z; times the mean):{}",
            what, frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
            c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
@@ -11197,7 +11206,7 @@ void capture_log(const char* what, uint32_t frames) {
                         : "no",
            c.lightAt[1] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[1][0], c.lightPos[1][1], c.lightPos[1][2])
                         : "no",
-           c.casts, c.hits.size(), c.lightHits[0], c.lightHits[1], c.display, c.level, capture_brightest());
+           c.casts, c.hits.size(), c.lightHits[0], c.lightHits[1], c.display, c.seen, c.level, capture_brightest());
 }
 
 // XR thread, every frame: whether ambient capture may run (the menus, or

@@ -1653,9 +1653,11 @@ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLa
   const PipelineRef runtimeKey = xxh3_hash(layout.key, cacheKey);
   if (ready.contains(runtimeKey))
     return runtimeKey;
-  // XR room lighting's variants (a dev tool) aren't kept for prewarming the
-  // next launch: a session trying its views would leave hundreds to build.
-  remember_pipeline_config(ShaderType::GX, config, current_frame(), config.shaderConfig.xrRoom == 0 && config.shaderConfig.xrSmoothNrm == 0);
+  // XR room lighting's variants are kept for prewarming the next launch
+  // (built mid-fight, each cost 100-200 ms on the Quest: hundreds a stage),
+  // but not its debug views': a session trying them would leave hundreds
+  // more to build.
+  remember_pipeline_config(ShaderType::GX, config, current_frame(), config.shaderConfig.xrRoomView == 0);
   const PipelineRef ref = resolve_pipeline(ShaderType::GX, config, layout,
                                            g_pipelineSync ? PipelinePriority::Blocking : PipelinePriority::Normal);
   {
