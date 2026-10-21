@@ -6135,11 +6135,11 @@ float stage_gloss(int grkind) {
   switch (grkind) {
   case 0x0E: // Corneria: the Great Fox
   case 0x0F: // Venom
-    return 0.6f;
+    return 1.f;
   case 0x12: // Mute City
   case 0x13: // Big Blue
   case 0x22: // Big Blue's route
-    return 0.36f;
+    return 0.6f;
   default:
     return 0.f;
   }
