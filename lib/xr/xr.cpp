@@ -4593,6 +4593,7 @@ RoomSurvey room_finish(const RoomSamples& rs, const XrPosef& head, XrTime time) 
 // ray from the head while it does.
 int capture_casting();
 void capture_ambient(bool ok);
+void capture_moved(XrVector3f p0, float y0, XrVector3f p1, float y1);
 void capture_note_cast();
 void capture_note_hit(const XrVector3f& origin, const XrVector3f& point);
 
@@ -5149,6 +5150,7 @@ float pose_yaw(const XrQuaternionf& q) {
 // Every arena pose moved by the same rigid turn about +Y and shift: (p0,
 // y0) goes to (p1, y1). Under g_arenaMutex.
 void move_arenas(XrVector3f p0, float y0, XrVector3f p1, float y1) {
+  capture_moved(p0, y0, p1, y1); // the room's captured light keeps its place too
   const float dy = y1 - y0;
   auto move = [&](ArenaPose& a) {
     a.pos = p1 + rot_y(a.pos - p0, dy);
@@ -6178,6 +6180,12 @@ struct {
   // frame; the parts are running means (kCapPartMax), so the room keeps up.
   bool room = false, ambientOk = false;
   uint32_t ambientFrames = 0; // since the last log
+  // The capture's own frame in LOCAL (p = pos + rot_y(p_capture, yaw)): its
+  // parts and hits are kept in it, and a recenter or the stage spot's
+  // anchor moving (move_arenas) moves it, so the lights keep their place in
+  // the room; the light made from them (sh, lightDir, lightPos) is in LOCAL.
+  XrVector3f pos{};
+  float yaw = 0.f;
   bool haveCamera = false;
   float q[4]{0.f, 0.f, 0.f, 1.f}, t[3]{}, k[4]{};
   int sensorW = 0, sensorH = 0, w = 0, h = 0;
@@ -6344,9 +6352,10 @@ void capture_make() {
   std::array<std::array<double, 3>, 9> acc{};
   for (int i = 0; i < kCapCells; ++i) {
     float dw;
-    const auto dv = cap_dir(i, dw);
-    const double dl = std::sqrt(double(dv[0]) * dv[0] + double(dv[1]) * dv[1] + double(dv[2]) * dv[2]);
-    const double x = dv[0] / dl, y = dv[1] / dl, z = dv[2] / dl;
+    const auto dc = cap_dir(i, dw);
+    const XrVector3f dv = rot_y({dc[0], dc[1], dc[2]}, c.yaw); // in LOCAL
+    const double dl = std::sqrt(double(dv.x) * dv.x + double(dv.y) * dv.y + double(dv.z) * dv.z);
+    const double x = dv.x / dl, y = dv.y / dl, z = dv.z / dl;
     const std::array<double, 9> poly{1.0, y, z, x, x * y, y * z, 3.0 * z * z - 1.0, x * z, x * x - y * y};
     for (int k = 0; k < 9; ++k)
       for (int ch = 0; ch < 3; ++ch)
@@ -6382,7 +6391,10 @@ void capture_make() {
   for (int l = 0; l < 2; ++l)
     for (int ch = 0; ch < 3; ++ch)
       c.light[l][ch] = static_cast<float>(light[l][ch] * scale);
-  c.lightDir = lightDir;
+  for (int l = 0; l < 2; ++l) {
+    const XrVector3f d = rot_y({lightDir[l][0], lightDir[l][1], lightDir[l][2]}, c.yaw);
+    c.lightDir[l] = {d.x, d.y, d.z};
+  }
   // Where the lights are, from the depth hits within 10 degrees of them
   // (none: at a distance, as daylight through a window, whose glass depth
   // doesn't see).
@@ -6400,7 +6412,10 @@ void capture_make() {
     c.lightHits[l] = n;
     if (n < 2)
       continue;
-    c.lightPos[l] = {static_cast<float>(sum[0] / n), static_cast<float>(sum[1] / n), static_cast<float>(sum[2] / n)};
+    const XrVector3f at = c.pos + rot_y({static_cast<float>(sum[0] / n), static_cast<float>(sum[1] / n),
+                                         static_cast<float>(sum[2] / n)},
+                                        c.yaw);
+    c.lightPos[l] = {at.x, at.y, at.z};
     c.lightAt[l] = true;
   }
   c.coverage = static_cast<float>(seenW / (4.0 * 3.14159265358979323846));
@@ -6414,6 +6429,8 @@ void capture_start() {
   g_capture.room = true;
   g_capture.ambientFrames = 0;
   g_capture.hitNext = 0;
+  g_capture.pos = {};
+  g_capture.yaw = 0.f;
   g_capture.untilNs = 0;
   g_capture.parts = {};
   g_capture.frames = g_capture.sinceMade = 0;
@@ -6429,6 +6446,29 @@ void capture_start() {
 void capture_stop() {
   std::lock_guard lock{g_capture.mutex};
   g_capture.requested = g_capture.room = false;
+}
+
+// Under g_arenaMutex (move_arenas): the room moved in LOCAL, (p0, y0) to
+// (p1, y1); the capture's frame and its light move with it. A turn of a
+// degree or more remakes the light (its SH turned with the parts).
+void capture_moved(XrVector3f p0, float y0, XrVector3f p1, float y1) {
+  std::lock_guard lock{g_capture.mutex};
+  auto& c = g_capture;
+  const float dy = y1 - y0;
+  c.pos = p1 + rot_y(c.pos - p0, dy);
+  c.yaw += dy;
+  for (int l = 0; l < 2; ++l) {
+    const XrVector3f at = p1 + rot_y(XrVector3f{c.lightPos[l][0], c.lightPos[l][1], c.lightPos[l][2]} - p0, dy);
+    const XrVector3f d = rot_y({c.lightDir[l][0], c.lightDir[l][1], c.lightDir[l][2]}, dy);
+    c.lightPos[l] = {at.x, at.y, at.z};
+    c.lightDir[l] = {d.x, d.y, d.z};
+  }
+  if (c.made && std::abs(dy) > 0.0175f) {
+    capture_make();
+    Log.info("Room capture: the room turned {:.0f} deg in tracking space; its lights kept their place (key from "
+             "{:.2f},{:.2f},{:.2f})",
+             dy * 57.2958f, c.lightDir[0][0], c.lightDir[0][1], c.lightDir[0][2]);
+  }
 }
 
 // A capture's frames wanted now: 1 (the 20 s after choosing ROOM), 2
@@ -6457,7 +6497,8 @@ void capture_note_hit(const XrVector3f& origin, const XrVector3f& point) {
     return;
   std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
-  const std::array<float, 6> h{d[0] / n, d[1] / n, d[2] / n, point.x, point.y, point.z};
+  const XrVector3f u = rot_y({d[0] / n, d[1] / n, d[2] / n}, -c.yaw), q = rot_y(point - c.pos, -c.yaw);
+  const std::array<float, 6> h{u.x, u.y, u.z, q.x, q.y, q.z};
   if (c.hits.size() < 16384)
     c.hits.push_back(h);
   else
@@ -11192,8 +11233,9 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
       const float px = (gx + 0.5f) * c.w / cols * sx, py = (gy + 0.5f) * c.h / rows * sy;
       const std::array<float, 3> cam{(px - c.k[2]) / c.k[0], (py - c.k[3]) / c.k[1], 1.f};
       const auto inHead = rotate(-c.q[0], -c.q[1], -c.q[2], c.q[3], cam);
-      const auto inRoom = rotate(head.x, head.y, head.z, head.w, inHead);
-      const int cell = cap_cell(inRoom, kCapF);
+      const auto inLocal = rotate(head.x, head.y, head.z, head.w, inHead);
+      const XrVector3f inRoom = rot_y({inLocal[0], inLocal[1], inLocal[2]}, -c.yaw); // the capture's frame
+      const int cell = cap_cell({inRoom.x, inRoom.y, inRoom.z}, kCapF);
       if (cell < 0)
         continue;
       const float* p = rgb + (gy * cols + gx) * 4;
