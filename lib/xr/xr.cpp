@@ -6189,8 +6189,9 @@ constexpr float kCapFighters = 0.7f;
 // the camera caught the ceiling light (2026-10-21: up 0.115 and level 0.58,
 // too dark, looking ahead; 0.33-0.40 and 1.25, overlit, with the light in
 // view), the room the same. The walls' median hardly moves with a fixture
-// in or out of view (provisional: 12, calibrated against one capture of each).
-constexpr float kCapMedian = 12.f;
+// in or out of view: 0.096 looking ahead, 0.092 with the light, where the
+// user's STRENGTH put the levels at 0.92 and 0.78 (by 9.6 and 8.4).
+constexpr float kCapMedian = 9.f;
 constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
 // Ambient capture: each part a running mean of about its last 600 samples.
 constexpr double kCapPartMax = 600.0;
