@@ -6189,9 +6189,11 @@ constexpr float kCapFighters = 0.7f;
 // the camera caught the ceiling light (2026-10-21: up 0.115 and level 0.58,
 // too dark, looking ahead; 0.33-0.40 and 1.25, overlit, with the light in
 // view), the room the same. The walls' median hardly moves with a fixture
-// in or out of view: 0.096 looking ahead, 0.092 with the light, where the
-// user's STRENGTH put the levels at 0.92 and 0.78 (by 9.6 and 8.4).
-constexpr float kCapMedian = 9.f;
+// in or out of view. Less where the capture found lights, which add their
+// own on top (as up 1: the sum of their luminance): six captures, where the
+// user's STRENGTH put the level at 9.6 times the median with no light, 9.0
+// at 0.04, 8.1-8.4 at 0.12 and 7.6-7.7 at 0.16 (2026-10-21).
+constexpr float kCapMedian = 9.6f, kCapLightDim = 1.25f;
 constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
 // Ambient capture: each part a running mean of about its last 600 samples.
 constexpr double kCapPartMax = 600.0;
@@ -6235,6 +6237,7 @@ struct {
   float mean = 1.f, display = 0.f, level = 1.f; // mean light (up 1), passthrough's up, level
   float seen = 0.f;   // the seen parts' mean luminance, in passthrough's scale (as display)
   float middle = 0.f; // and their median by solid angle
+  float unclamped = 0.f; // the level before its clamp
   // The light last made from them (made: any).
   bool made = false;
   std::array<std::array<float, 3>, 9> sh{};
@@ -6427,7 +6430,9 @@ void capture_make() {
   // The level from the walls as seen, not from above: a light in or out of
   // the camera's view (it sees ~36 degrees up and down) moves the light
   // from above 3x, the room the same.
-  c.level = std::clamp(kCapMedian * c.middle, 0.15f, 1.25f);
+  const double lights = (lum_of(light[0]) + lum_of(light[1])) * scale;
+  c.unclamped = static_cast<float>(kCapMedian * std::max(1.0 - kCapLightDim * lights, 0.5) * c.middle);
+  c.level = std::clamp(c.unclamped, 0.15f, 1.25f);
   c.mean = static_cast<float>((0.2126 * sh[0][0] + 0.7152 * sh[0][1] + 0.0722 * sh[0][2] +
                                0.25 * (lum_of(light[0]) + lum_of(light[1]))) * scale);
   for (int k = 0; k < 9; ++k)
@@ -11223,7 +11228,7 @@ void capture_log(const char* what, uint32_t frames) {
            c.lightAt[1] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[1][0], c.lightPos[1][1], c.lightPos[1][2])
                         : "no",
            c.casts, c.hits.size(), c.lightHits[0], c.lightHits[1], c.display, c.seen, c.middle, c.level,
-           kCapMedian * c.middle, capture_brightest());
+           c.unclamped, capture_brightest());
 }
 
 // XR thread, every frame: whether ambient capture may run (the menus, or
