@@ -6128,10 +6128,12 @@ struct {
 // of mean colour, over its exposure times sensitivity (relative radiance),
 // lands by the ray of each cell (the lens's intrinsics, its pose against the
 // head, the head's latest pose) in a cube of kCapN x kCapN cells a face, in
-// the room. A cell's radiance is the mean of the frames that showed it
-// unclipped (auto exposure adapts as the head turns to a lamp), else of the
-// clipped ones, boosted by how much clipped (a lower bound, and a lamp seen
-// only clipped would otherwise vanish into the sky). The light is remade
+// the room, each of kCapSub x kCapSub parts. A part's radiance is the mean
+// of its samples, the clipped boosted by how much clipped (a lower bound,
+// and a lamp seen only clipped would otherwise vanish into the sky); a
+// cell's is its parts' by solid angle, the unseen ones its hemisphere's
+// mean (a lamp seen at the frame's edge alone lights by the part it covers,
+// not the whole cell). The light is remade
 // every few frames: up to two lights, the brightest cells at least 45
 // degrees apart, by their excess over the mean (the shader's key and fill;
 // a window and a ceiling light both count), the rest as SH L2 as the
@@ -6144,8 +6146,8 @@ struct {
 // the level, times STRENGTH), and the fighters as the room's mean light
 // over every direction (kCapFighters times the level): a backlit room
 // shades their front, but on average they keep the game's brightness.
-constexpr int kCapN = 8;
-constexpr int kCapCells = 6 * kCapN * kCapN;
+constexpr int kCapN = 8, kCapSub = 3, kCapF = kCapN * kCapSub;
+constexpr int kCapCells = 6 * kCapN * kCapN, kCapParts = 6 * kCapF * kCapF;
 constexpr int64_t kCaptureNs = 20'000'000'000;
 // The level per unit of passthrough brightness (T4 found the camera's mean
 // linear luminance about 0.16 in a room the stage looked right in, and the
@@ -6164,8 +6166,11 @@ struct {
   bool haveCamera = false;
   float q[4]{0.f, 0.f, 0.f, 1.f}, t[3]{}, k[4]{};
   int sensorW = 0, sensorH = 0, w = 0, h = 0;
-  // r, g, b sums and their count: unclipped samples, then clipped (boosted).
-  std::array<std::array<double, 8>, kCapCells> cells{};
+  // Each part's r, g, b sums and their count: unclipped samples, then clipped (boosted).
+  std::array<std::array<double, 8>, kCapParts> parts{};
+  // Each cell's luminance and how it was seen (clear and clipped samples,
+  // parts seen), for the log.
+  std::array<std::array<float, 4>, kCapCells> seenAs{};
   uint32_t frames = 0, sinceMade = 0;
   float exposure = -1.f, iso = -1.f;
   std::vector<float> factors; // each frame's exposure (ms) times ISO over 100
@@ -6188,8 +6193,9 @@ int64_t steady_ns() {
       .count();
 }
 
-// A direction's cube cell, and a cell's direction (unnormalized) and solid angle.
-int cap_cell(const std::array<float, 3>& d) {
+// A direction's cube cell (of n x n a face), and a cell's direction
+// (unnormalized) and solid angle.
+int cap_cell(const std::array<float, 3>& d, int n = kCapN) {
   const float ax = std::abs(d[0]), ay = std::abs(d[1]), az = std::abs(d[2]);
   int face;
   float u, v, m;
@@ -6201,19 +6207,19 @@ int cap_cell(const std::array<float, 3>& d) {
     face = d[2] > 0.f ? 4 : 5, m = az, u = d[0], v = d[1];
   if (!(m > 0.f))
     return -1;
-  const int i = std::clamp(static_cast<int>((u / m + 1.f) * 0.5f * kCapN), 0, kCapN - 1);
-  const int j = std::clamp(static_cast<int>((v / m + 1.f) * 0.5f * kCapN), 0, kCapN - 1);
-  return (face * kCapN + j) * kCapN + i;
+  const int i = std::clamp(static_cast<int>((u / m + 1.f) * 0.5f * n), 0, n - 1);
+  const int j = std::clamp(static_cast<int>((v / m + 1.f) * 0.5f * n), 0, n - 1);
+  return (face * n + j) * n + i;
 }
-std::array<float, 3> cap_dir(int cell, float& dOmega) {
-  const int face = cell / (kCapN * kCapN), j = (cell / kCapN) % kCapN, i = cell % kCapN;
-  const float u = (i + 0.5f) / kCapN * 2.f - 1.f, v = (j + 0.5f) / kCapN * 2.f - 1.f;
+std::array<float, 3> cap_dir(int cell, float& dOmega, int n = kCapN) {
+  const int face = cell / (n * n), j = (cell / n) % n, i = cell % n;
+  const float u = (i + 0.5f) / n * 2.f - 1.f, v = (j + 0.5f) / n * 2.f - 1.f;
   const float s = face % 2 == 0 ? 1.f : -1.f;
   const std::array<float, 3> d = face < 2 ? std::array<float, 3>{s, v, u}
                                  : face < 4 ? std::array<float, 3>{u, s, v}
                                             : std::array<float, 3>{u, v, s};
   const float r2 = 1.f + u * u + v * v;
-  dOmega = (4.f / (kCapN * kCapN)) / (r2 * std::sqrt(r2));
+  dOmega = (4.f / (n * n)) / (r2 * std::sqrt(r2));
   return d;
 }
 
@@ -6222,37 +6228,56 @@ void capture_make() {
   auto& c = g_capture;
   std::array<std::array<double, 3>, kCapCells> L{};
   std::array<bool, kCapCells> seen{};
-  std::array<double, 3> hemi[2]{}; // seen cells' mean radiance, upper and lower
-  double hemiN[2]{};
-  int seenN = 0;
-  // A cell's samples (2 degrees each) see different parts of it: a lamp's
-  // clipped, the ceiling around it clear. All count, the clipped boosted.
-  for (int i = 0; i < kCapCells; ++i) {
-    const auto& e = c.cells[i];
+  // The parts' radiance, and the seen parts' mean by solid angle, upper and
+  // lower hemisphere.
+  std::vector<std::array<double, 3>> P(kCapParts);
+  std::vector<bool> partSeen(kCapParts);
+  std::array<double, 3> hemi[2]{};
+  double hemiW[2]{}, seenW = 0.0;
+  for (int f = 0; f < kCapParts; ++f) {
+    const auto& e = c.parts[f];
     if (!(e[3] + e[7] > 0.0))
       continue;
-    seen[i] = true;
-    ++seenN;
+    partSeen[f] = true;
     float dw;
-    const auto d = cap_dir(i, dw);
+    const auto d = cap_dir(f, dw, kCapF);
     const int h = d[1] >= 0.f ? 0 : 1;
     for (int k = 0; k < 3; ++k) {
-      L[i][k] = (e[k] + e[4 + k]) / (e[3] + e[7]);
-      hemi[h][k] += L[i][k];
+      P[f][k] = (e[k] + e[4 + k]) / (e[3] + e[7]);
+      hemi[h][k] += P[f][k] * dw;
     }
-    hemiN[h] += 1.0;
+    hemiW[h] += dw;
+    seenW += dw;
   }
-  if (seenN == 0)
+  if (!(seenW > 0.0))
     return;
   for (int h = 0; h < 2; ++h)
     for (int k = 0; k < 3; ++k)
-      hemi[h][k] = hemiN[h] > 0.0 ? hemi[h][k] / hemiN[h] : hemi[1 - h][k] / std::max(hemiN[1 - h], 1.0) * 0.5;
-  for (int i = 0; i < kCapCells; ++i)
-    if (!seen[i]) {
-      float dw;
-      const auto d = cap_dir(i, dw);
-      L[i] = hemi[d[1] >= 0.f ? 0 : 1];
+      hemi[h][k] = hemiW[h] > 0.0 ? hemi[h][k] / hemiW[h] : hemi[1 - h][k] / std::max(hemiW[1 - h], 1e-9) * 0.5;
+  // The cells: their parts by solid angle, the unseen ones their hemisphere's.
+  std::array<double, kCapCells> cellW{};
+  c.seenAs = {};
+  for (int f = 0; f < kCapParts; ++f) {
+    const int face = f / (kCapF * kCapF), j = (f / kCapF) % kCapF, i = f % kCapF;
+    const int cell = (face * kCapN + j / kCapSub) * kCapN + i / kCapSub;
+    float dw;
+    const auto d = cap_dir(f, dw, kCapF);
+    const auto& v = partSeen[f] ? P[f] : hemi[d[1] >= 0.f ? 0 : 1];
+    for (int k = 0; k < 3; ++k)
+      L[cell][k] += v[k] * dw;
+    cellW[cell] += dw;
+    if (partSeen[f]) {
+      seen[cell] = true;
+      c.seenAs[cell][1] += static_cast<float>(c.parts[f][3]);
+      c.seenAs[cell][2] += static_cast<float>(c.parts[f][7]);
+      c.seenAs[cell][3] += 1.f;
     }
+  }
+  for (int i = 0; i < kCapCells; ++i) {
+    for (int k = 0; k < 3; ++k)
+      L[i][k] /= cellW[i];
+    c.seenAs[i][0] = static_cast<float>(0.2126 * L[i][0] + 0.7152 * L[i][1] + 0.0722 * L[i][2]);
+  }
   // The lights: the brightest seen cells, at least 45 degrees apart, each
   // its excess over the mean of the room taken out of the sky as a
   // directional light of that irradiance over pi (as the presets' are).
@@ -6361,7 +6386,7 @@ void capture_make() {
     c.lightPos[l] = {static_cast<float>(sum[0] / n), static_cast<float>(sum[1] / n), static_cast<float>(sum[2] / n)};
     c.lightAt[l] = true;
   }
-  c.coverage = static_cast<float>(seenN) / kCapCells;
+  c.coverage = static_cast<float>(seenW / (4.0 * 3.14159265358979323846));
   c.made = true;
 }
 
@@ -6370,7 +6395,7 @@ void capture_start() {
   std::lock_guard lock{g_capture.mutex};
   g_capture.requested = true;
   g_capture.untilNs = 0;
-  g_capture.cells = {};
+  g_capture.parts = {};
   g_capture.frames = g_capture.sinceMade = 0;
   g_capture.made = false;
   g_capture.coverage = 0.f;
@@ -6426,30 +6451,26 @@ bool capture_light(std::array<std::array<float, 3>, 9>& sh, std::array<std::arra
 }
 
 // The capture's brightest cells, for the log: where, how bright (relative
-// to the mean), and how many of their frames clipped.
+// to the mean, as capture_make last made them), how many of their samples
+// clipped, and how many of their parts were seen.
 std::string capture_brightest() {
   auto& c = g_capture;
-  std::array<std::pair<double, int>, kCapCells> order;
+  std::array<std::pair<float, int>, kCapCells> order;
   double mean = 0.0;
-  int n = 0;
   for (int i = 0; i < kCapCells; ++i) {
-    const auto& e = c.cells[i];
-    const bool seen = e[3] + e[7] > 0.0;
-    const double lum =
-        seen ? (0.2126 * (e[0] + e[4]) + 0.7152 * (e[1] + e[5]) + 0.0722 * (e[2] + e[6])) / (e[3] + e[7]) : 0.0;
-    order[i] = {lum, i};
-    mean += lum, n += seen;
+    order[i] = {c.seenAs[i][3] > 0.f ? c.seenAs[i][0] : 0.f, i};
+    mean += c.seenAs[i][0] / kCapCells;
   }
-  mean /= std::max(n, 1);
   std::partial_sort(order.begin(), order.begin() + 6, order.end(), std::greater<>());
   std::string out;
-  for (int k = 0; k < 6 && order[k].first > 0.0; ++k) {
+  for (int k = 0; k < 6 && order[k].first > 0.f; ++k) {
     float dw;
     const auto d = cap_dir(order[k].second, dw);
     const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-    const auto& e = c.cells[order[k].second];
-    out += fmt::format(" {:.2f},{:.2f},{:.2f} x{:.1f} ({:.0f} clear, {:.0f} clipped);", d[0] / dl, d[1] / dl, d[2] / dl,
-                       order[k].first / std::max(mean, 1e-12), e[3], e[7]);
+    const auto& e = c.seenAs[order[k].second];
+    out += fmt::format(" {:.2f},{:.2f},{:.2f} x{:.1f} ({:.0f} clear, {:.0f} clipped, {:.0f}/{} parts);", d[0] / dl,
+                       d[1] / dl, d[2] / dl, order[k].first / std::max(mean, 1e-12), e[1], e[2], e[3],
+                       kCapSub * kCapSub);
   }
   return out;
 }
@@ -11109,7 +11130,7 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
       const std::array<float, 3> cam{(px - c.k[2]) / c.k[0], (py - c.k[3]) / c.k[1], 1.f};
       const auto inHead = rotate(-c.q[0], -c.q[1], -c.q[2], c.q[3], cam);
       const auto inRoom = rotate(head.x, head.y, head.z, head.w, inHead);
-      const int cell = cap_cell(inRoom);
+      const int cell = cap_cell(inRoom, kCapF);
       if (cell < 0)
         continue;
       const float* p = rgb + (gy * cols + gx) * 4;
@@ -11117,8 +11138,8 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
       const double s = scale * (clipped ? 1.0 + kCapClipBoost * p[3] : 1.0);
       const int o = clipped ? 4 : 0;
       for (int k = 0; k < 3; ++k)
-        c.cells[cell][o + k] += static_cast<double>(p[k]) * s;
-      c.cells[cell][o + 3] += 1.0;
+        c.parts[cell][o + k] += static_cast<double>(p[k]) * s;
+      c.parts[cell][o + 3] += 1.0;
     }
   // With the capture log, beside RoomCapture's frame dumps: the head, and
   // where the frame's middle and right edge point in the room.
