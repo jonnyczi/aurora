@@ -3995,7 +3995,8 @@ bool locate_floor(XrTime time, float& y) {
 struct SurfaceWorker {
   enum class Caster { Off, Creating, Ready, Declined, Unsupported, Failed };
   Caster caster = Caster::Off;
-  bool captureCasting = false; // a room capture's light_cast wanted (for its log)
+  int captureCasting = 0;  // capture_casting's, last loop (for the log)
+  int64_t lightCastNs = 0; // light_cast's last
   XrEnvironmentRaycasterMETA raycaster = XR_NULL_HANDLE;
   XrFutureEXT future = XR_NULL_FUTURE_EXT;
   int64_t createNs = 0, lastCastNs = 0;
@@ -4328,6 +4329,9 @@ void surface_log(SurfaceWorker& w, int64_t now, const ArenaSnapshot& a) {
 // defaults the player hasn't set (room_survey_apply); every placement is
 // still theirs. AURORA_XR_ROOM_SURVEY=0: none.
 constexpr float kRoomReach = 5.f;
+// Ambient room capture's pace: a frame (RoomCapture skips the rest) and a
+// light_cast each 200 ms.
+constexpr int kCapAmbientMs = 200;
 struct RoomSamples {
   struct Level {
     float y, d;
@@ -4587,7 +4591,8 @@ RoomSurvey room_finish(const RoomSamples& rs, const XrPosef& head, XrTime time) 
 
 // Room capture's (below): whether one is running, and a depth hit along a
 // ray from the head while it does.
-bool capture_casting();
+int capture_casting();
+void capture_ambient(bool ok);
 void capture_note_cast();
 void capture_note_hit(const XrVector3f& origin, const XrVector3f& point);
 
@@ -4638,7 +4643,7 @@ void surface_main() {
       // 15 casts a second while casting, the raycaster's future polled every
       // 50 ms while it's created; otherwise asleep until asked (waking each
       // second to let an idle raycaster go).
-      const bool surveyDue = (g_surface.surveyWanted && !g_surface.survey.done) || capture_casting();
+      const bool surveyDue = (g_surface.surveyWanted && !g_surface.survey.done) || capture_casting() != 0;
       if (!g_surface.stop && !g_surface.reset)
         g_surface.cv.wait_for(lock, w.caster == Caster::Creating ? std::chrono::milliseconds(50)
                                     : w.active || surveyDue      ? std::chrono::milliseconds(66)
@@ -4683,18 +4688,20 @@ void surface_main() {
         g_surface.survey = r;
       }
     }
-    if (const bool casting = capture_casting(); casting != w.captureCasting) {
+    const int casting = capture_casting();
+    if (casting != w.captureCasting) {
       w.captureCasting = casting;
-      if (casting)
+      if (casting == 1)
         Log.info("Room capture: casting (raycaster {}, head {}, time {})", static_cast<int>(w.caster), headValid,
                  time != 0);
     }
-    if (capture_casting() && headValid && time != 0 && B.envRaycast &&
-        (w.caster == Caster::Off || w.caster == Caster::Creating || w.caster == Caster::Ready)) {
+    // Ambient capture's casts at its frames' pace.
+    if (casting != 0 && (casting == 1 || now - w.lightCastNs >= kCapAmbientMs * kMsNs) && headValid && time != 0 &&
+        B.envRaycast && (w.caster == Caster::Off || w.caster == Caster::Creating || w.caster == Caster::Ready)) {
       raycaster_step(w);
       if (w.caster == Caster::Ready) {
         light_cast(w, head, time);
-        w.lastCastNs = now;
+        w.lastCastNs = w.lightCastNs = now;
       }
     }
     const bool active = placing || now < burstUntil;
@@ -6157,12 +6164,20 @@ constexpr int64_t kCaptureNs = 20'000'000'000;
 constexpr float kCapDisplay = 5.f;
 constexpr float kCapFighters = 0.7f;
 constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
+// Ambient capture: each part a running mean of about its last 600 samples.
+constexpr double kCapPartMax = 600.0;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
 struct {
   std::mutex mutex;
   bool requested = false;
   int64_t untilNs = 0; // steady clock; 0: not started (no head pose yet)
+  // Ambient capture: while ROOM is the source, in the menus and while the
+  // stage is placed (the head looks around the room there, past lights the
+  // camera's narrower view misses while it looks ahead), at kCapAmbientMs a
+  // frame; the parts are running means (kCapPartMax), so the room keeps up.
+  bool room = false, ambientOk = false;
+  uint32_t ambientFrames = 0; // since the last log
   bool haveCamera = false;
   float q[4]{0.f, 0.f, 0.f, 1.f}, t[3]{}, k[4]{};
   int sensorW = 0, sensorH = 0, w = 0, h = 0;
@@ -6173,9 +6188,11 @@ struct {
   std::array<std::array<float, 4>, kCapCells> seenAs{};
   uint32_t frames = 0, sinceMade = 0;
   float exposure = -1.f, iso = -1.f;
-  std::vector<float> factors; // each frame's exposure (ms) times ISO over 100
-  // Depth hits (light_cast): direction from the head (unit), then the point.
+  std::vector<float> factors; // recent frames' exposure (ms) times ISO over 100
+  // Depth hits (light_cast): direction from the head (unit), then the point;
+  // the oldest replaced once full.
   std::vector<std::array<float, 6>> hits;
+  size_t hitNext = 0;
   uint32_t casts = 0;
   std::array<bool, 2> lightAt{};                 // a light with a place in the room
   std::array<std::array<float, 3>, 2> lightPos{}; // where
@@ -6394,6 +6411,9 @@ void capture_make() {
 void capture_start() {
   std::lock_guard lock{g_capture.mutex};
   g_capture.requested = true;
+  g_capture.room = true;
+  g_capture.ambientFrames = 0;
+  g_capture.hitNext = 0;
   g_capture.untilNs = 0;
   g_capture.parts = {};
   g_capture.frames = g_capture.sinceMade = 0;
@@ -6405,9 +6425,24 @@ void capture_start() {
   g_capture.lightAt = {};
 }
 
-bool capture_casting() {
+// Another source chosen: no ambient capture.
+void capture_stop() {
   std::lock_guard lock{g_capture.mutex};
-  return g_capture.requested && g_capture.untilNs != 0;
+  g_capture.requested = g_capture.room = false;
+}
+
+// A capture's frames wanted now: 1 (the 20 s after choosing ROOM), 2
+// (ambient), 0 (none). Under g_capture.mutex.
+int capture_mode_locked() {
+  const auto& c = g_capture;
+  return c.requested ? 1 : c.room && c.ambientOk ? 2 : 0;
+}
+
+// light_cast's: 1 while a capture's first frames are in, 2 ambient, 0 not.
+int capture_casting() {
+  std::lock_guard lock{g_capture.mutex};
+  const int mode = capture_mode_locked();
+  return mode == 1 ? (g_capture.untilNs != 0 ? 1 : 0) : mode == 2 && g_capture.frames > 0 ? 2 : 0;
 }
 
 void capture_note_cast() {
@@ -6421,8 +6456,12 @@ void capture_note_hit(const XrVector3f& origin, const XrVector3f& point) {
   if (!(n > 0.05f))
     return;
   std::lock_guard lock{g_capture.mutex};
-  if (g_capture.hits.size() < 16384)
-    g_capture.hits.push_back({d[0] / n, d[1] / n, d[2] / n, point.x, point.y, point.z});
+  auto& c = g_capture;
+  const std::array<float, 6> h{d[0] / n, d[1] / n, d[2] / n, point.x, point.y, point.z};
+  if (c.hits.size() < 16384)
+    c.hits.push_back(h);
+  else
+    c.hits[c.hitNext++ % c.hits.size()] = h;
 }
 
 // The captured light for room_frame: false while none is made.
@@ -7394,6 +7433,8 @@ void light_choose(int row, float px) {
   }
   if (row == kRlSource && i == kRoomSourceCaptured)
     capture_start(); // again each time it's chosen
+  else if (row == kRlSource)
+    capture_stop();
   room_light_apply(r);
   P.dirty = true;
   light_log();
@@ -8028,8 +8069,9 @@ bool render_xr_frame() {
   B.triggersClick = onScreen || onPanel;
   // The surface under the stage is measured while it's being placed: the
   // hold before a fight, or a grab in a pause.
-  surface_frame(fight, fight && (placing > 0 || (G.target == Target::Arena && (G.oneHand >= 0 || G.twoHands))),
-                fs.predictedDisplayTime);
+  const bool placingNow = fight && (placing > 0 || (G.target == Target::Arena && (G.oneHand >= 0 || G.twoHands)));
+  surface_frame(fight, placingNow, fs.predictedDisplayTime);
+  capture_ambient(!fight || placing > 0);
   room_survey_apply();
   spot_frame(fs.predictedDisplayTime);
 
@@ -11047,31 +11089,51 @@ extern "C" void aurora_xr_set_stage_top(float y) {
   aurora::xr::g_stageTop = y;
 }
 
+namespace aurora::xr {
+namespace {
+// The capture's log line, as just made (under g_capture.mutex).
+void capture_log(const char* what, uint32_t frames) {
+  auto& c = g_capture;
+  Log.info("Room capture{}: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
+           "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} (placed: {}, {}; {} casts, {} hits kept, {} and {} "
+           "near the lights); passthrough's up {:.4f}, level {:.2f}; "
+           "brightest cells (room x,y,z; times the mean):{}",
+           what, frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
+           c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
+           c.lightDir[1][1], c.lightDir[1][2],
+           c.lightAt[0] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[0][0], c.lightPos[0][1], c.lightPos[0][2])
+                        : "no",
+           c.lightAt[1] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[1][0], c.lightPos[1][1], c.lightPos[1][2])
+                        : "no",
+           c.casts, c.hits.size(), c.lightHits[0], c.lightHits[1], c.display, c.level, capture_brightest());
+}
+
+// XR thread, every frame: whether ambient capture may run (the menus, or
+// the stage being placed). Leaving them logs what it gathered.
+void capture_ambient(bool ok) {
+  std::lock_guard lock{g_capture.mutex};
+  auto& c = g_capture;
+  if (c.ambientOk && !ok && c.ambientFrames > 0 && !c.requested) {
+    capture_make();
+    capture_log(" (ambient)", c.ambientFrames);
+    c.ambientFrames = 0;
+  }
+  c.ambientOk = ok;
+}
+} // namespace
+} // namespace aurora::xr
+
 extern "C" int aurora_xr_room_capture_wanted(void) {
   using namespace aurora::xr;
   std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
-  if (!c.requested)
-    return 0;
-  if (c.untilNs != 0 && steady_ns() >= c.untilNs) {
+  if (c.requested && c.untilNs != 0 && steady_ns() >= c.untilNs) {
     c.requested = false;
     capture_make();
-    Log.info("Room capture: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
-             "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} (placed: {}, {}; {} casts, {} of {} rays hit, {} and {} "
-             "near the lights); passthrough's up {:.4f}, level {:.2f}; "
-             "brightest cells (room x,y,z; times the mean):{}",
-             c.frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
-             c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
-             c.lightDir[1][1], c.lightDir[1][2],
-             c.lightAt[0] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[0][0], c.lightPos[0][1], c.lightPos[0][2])
-                          : "no",
-             c.lightAt[1] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[1][0], c.lightPos[1][1], c.lightPos[1][2])
-                          : "no",
-             c.casts, c.hits.size(), c.casts * 20, c.lightHits[0], c.lightHits[1], c.display, c.level,
-             capture_brightest());
-    return 0;
+    capture_log("", c.frames);
+    c.ambientFrames = 0;
   }
-  return 1;
+  return capture_mode_locked();
 }
 
 extern "C" void aurora_xr_room_capture_camera(const float rotation[4], const float translation[3],
@@ -11111,9 +11173,10 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
   // A frame without its exposure (the first, before Camera2's first
   // result) is left out: unscaled, it read ~100 times too bright, a light
   // wherever the head pointed then.
-  if (!c.requested || !c.haveCamera || cols <= 0 || rows <= 0 || !(exposure_ms > 0.f && iso > 0.f))
+  const int mode = capture_mode_locked();
+  if (mode == 0 || !c.haveCamera || cols <= 0 || rows <= 0 || !(exposure_ms > 0.f && iso > 0.f))
     return;
-  if (c.untilNs == 0)
+  if (mode == 1 && c.untilNs == 0)
     c.untilNs = steady_ns() + kCaptureNs;
   // Relative radiance: over exposure times sensitivity.
   const float scale = 100.f / (exposure_ms * iso);
@@ -11140,6 +11203,11 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
       for (int k = 0; k < 3; ++k)
         c.parts[cell][o + k] += static_cast<double>(p[k]) * s;
       c.parts[cell][o + 3] += 1.0;
+      if (auto& e = c.parts[cell]; e[3] + e[7] > kCapPartMax) {
+        const double keep = kCapPartMax / (e[3] + e[7]);
+        for (double& x : e)
+          x *= keep;
+      }
     }
   // With the capture log, beside RoomCapture's frame dumps: the head, and
   // where the frame's middle and right edge point in the room.
@@ -11157,7 +11225,11 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
   }
   c.exposure = exposure_ms, c.iso = iso;
   c.factors.push_back(exposure_ms * iso / 100.f);
+  if (c.factors.size() > 600)
+    c.factors.erase(c.factors.begin(), c.factors.begin() + 300);
   ++c.frames;
+  if (mode == 2)
+    ++c.ambientFrames;
   if (++c.sinceMade >= 5) {
     c.sinceMade = 0;
     capture_make();
