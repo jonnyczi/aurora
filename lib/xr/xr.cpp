@@ -6454,11 +6454,14 @@ std::string capture_brightest() {
   return out;
 }
 
-// The Light page's ROOM segment while a capture runs: how much of the room
-// has been seen (-1: none running).
-float capture_progress() {
+// The Light page's ROOM segment while a capture runs: the seconds left
+// (-1: none running).
+int capture_seconds_left() {
   std::lock_guard lock{g_capture.mutex};
-  return g_capture.requested ? g_capture.coverage : -1.f;
+  if (!g_capture.requested)
+    return -1;
+  const int64_t left = g_capture.untilNs == 0 ? kCaptureNs : std::max<int64_t>(g_capture.untilNs - steady_ns(), 0);
+  return static_cast<int>((left + 999'999'999) / 1'000'000'000);
 }
 
 // The sky gradient's SH L2 irradiance, divided by pi (so a uniform sky of
@@ -7240,11 +7243,11 @@ void draw_light(Canvas& c) {
       const bool on = i == chosen;
       c.fill(x0 + 2, y - 4, x0 + w - 2, y + kTrackH + 4,
              on ? (usable ? Rgba{70, 110, 150, 255} : Rgba{60, 64, 74, 255}) : Rgba{36, 40, 50, 255});
-      // ROOM while it captures: how much of the room it has seen.
+      // ROOM while it captures: the seconds left.
       std::string label = names[i];
       if (row == kRlSource && i == kRoomSourceCaptured)
-        if (const float seen = capture_progress(); seen >= 0.f) {
-          label = fmt::format("{:.0f}%", seen * 100.f);
+        if (const int left = capture_seconds_left(); left >= 0) {
+          label = fmt::format("{}S", left);
           P.dirty = true; // drawn again next frame
         }
       const int tw = static_cast<int>(label.size()) * 18 - 3;
@@ -7634,6 +7637,7 @@ bool build_dev_panel_layer(XrCompositionLayerQuad& q) {
   if (!P.shown)
     return false;
   if (P.dirty && now - P.drawn >= std::chrono::milliseconds(50)) {
+    P.dirty = false; // before drawing: a page may ask to be drawn again
     Canvas c{kPanelW, kPanelH};
     draw_panel(c);
     if (P.image.swapchain)
@@ -7648,7 +7652,6 @@ bool build_dev_panel_layer(XrCompositionLayerQuad& q) {
         Log.warn("Dev tools panel: picture not uploaded");
       warned = true;
     }
-    P.dirty = false;
     P.drawn = now;
   }
   if (!P.image.swapchain)
@@ -11084,12 +11087,15 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
   }
   std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
-  if (!c.requested || !c.haveCamera || cols <= 0 || rows <= 0)
+  // A frame without its exposure (the first, before Camera2's first
+  // result) is left out: unscaled, it read ~100 times too bright, a light
+  // wherever the head pointed then.
+  if (!c.requested || !c.haveCamera || cols <= 0 || rows <= 0 || !(exposure_ms > 0.f && iso > 0.f))
     return;
   if (c.untilNs == 0)
     c.untilNs = steady_ns() + kCaptureNs;
-  // Relative radiance: over exposure times sensitivity, where reported.
-  const float scale = exposure_ms > 0.f && iso > 0.f ? 100.f / (exposure_ms * iso) : 1.f;
+  // Relative radiance: over exposure times sensitivity.
+  const float scale = 100.f / (exposure_ms * iso);
   const auto rotate = [](float qx, float qy, float qz, float qw, const std::array<float, 3>& v) {
     // v + 2w (q x v) + 2 q x (q x v)
     const float tx = 2.f * (qy * v[2] - qz * v[1]), ty = 2.f * (qz * v[0] - qx * v[2]), tz = 2.f * (qx * v[1] - qy * v[0]);
@@ -11114,9 +11120,22 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
         c.cells[cell][o + k] += static_cast<double>(p[k]) * s;
       c.cells[cell][o + 3] += 1.0;
     }
+  // With the capture log, beside RoomCapture's frame dumps: the head, and
+  // where the frame's middle and right edge point in the room.
+  static const bool dumpLog = env_flag("AURORA_XR_ROOM_CAPTURE_LOG", false);
+  if (dumpLog && (c.frames == 30 || c.frames == 150 || c.frames == 280)) {
+    const auto toRoom = [&](float px, float py) {
+      const std::array<float, 3> cam{(px * sx - c.k[2]) / c.k[0], (py * sy - c.k[3]) / c.k[1], 1.f};
+      auto d = rotate(head.x, head.y, head.z, head.w, rotate(-c.q[0], -c.q[1], -c.q[2], c.q[3], cam));
+      const float n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      return fmt::format("{:.2f},{:.2f},{:.2f}", d[0] / n, d[1] / n, d[2] / n);
+    };
+    Log.info("Room capture: frame {} head {:.3f},{:.3f},{:.3f},{:.3f}; middle {}, right edge {}, left edge {}",
+             c.frames, head.x, head.y, head.z, head.w, toRoom(c.w * 0.5f, c.h * 0.5f), toRoom(c.w, c.h * 0.5f),
+             toRoom(0.f, c.h * 0.5f));
+  }
   c.exposure = exposure_ms, c.iso = iso;
-  if (exposure_ms > 0.f && iso > 0.f)
-    c.factors.push_back(exposure_ms * iso / 100.f);
+  c.factors.push_back(exposure_ms * iso / 100.f);
   ++c.frames;
   if (++c.sinceMade >= 5) {
     c.sinceMade = 0;

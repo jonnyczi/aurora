@@ -161,7 +161,7 @@ void aurora_xr_room_capture_camera(const float rotation[4], const float translat
                                    int sensor_width, int sensor_height, int width, int height);
 /* A frame: cols x rows cells of mean linear RGB and the share of the cell
  * that clipped (row-major from the top left, 4 floats each), with its
- * exposure (ms) and sensitivity (ISO); unknown ones negative. Any thread. */
+ * exposure (ms) and sensitivity (ISO); unknown ones negative (the frame is then left out). Any thread. */
 void aurora_xr_room_capture_frame(const float* rgb, int cols, int rows, float exposure_ms, float iso);
 
 /* The room's colour grade for the current stage's fights in mixed reality:
