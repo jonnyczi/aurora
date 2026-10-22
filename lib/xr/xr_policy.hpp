@@ -113,6 +113,7 @@ enum class Act {
   DDown,
   DLeft,
   DRight,
+  View, // the Steam Frame's left View button: room or skybox, in a paused fight
   RumbleL,
   RumbleR,
 };
@@ -129,9 +130,10 @@ std::vector<Binding> touch_bindings(bool haptics);
 // the order to try: a suggestion with one path the runtime doesn't know is
 // rejected whole, and SteamVR renamed the shoulder buttons (bumper, before
 // 2.17.10). The shoulders fill the Touch fight table's grip inputs (Z by
-// default), the grips only grab, A/B/X/Y on the right controller,
-// the left D-pad the GameCube's, the right menu button Start; the first
-// variants with haptics.
+// default), the grips only grab, A/B/X/Y on the right controller, the left
+// D-pad the GameCube's, the right menu button Start, the left View button
+// View (the first variants; the rest without it, in case it's refused); the
+// first variants with haptics.
 std::vector<std::vector<Binding>> frame_binding_variants();
 
 // ---------------------------------------------------------------- swapchains

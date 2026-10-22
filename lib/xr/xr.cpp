@@ -489,6 +489,8 @@ ScreenPointer g_screenPointer;
 // A hand is pressing the screen's Back button (aurora_xr_screen_back).
 // Under g_padMutex.
 bool g_screenBack = false;
+// The View button went down since aurora_xr_take_view_press last took it.
+std::atomic<bool> g_viewPressed{false};
 // The frame's size as the game draws it: the picture is letterboxed on the
 // screen when its aspect differs from the screen's.
 std::atomic<uint32_t> g_contentW{0}, g_contentH{0};
@@ -617,6 +619,7 @@ struct Bridge {
   XrAction btnA = XR_NULL_HANDLE, btnB = XR_NULL_HANDLE, btnX = XR_NULL_HANDLE, btnY = XR_NULL_HANDLE;
   XrAction btnStart = XR_NULL_HANDLE;
   std::array<XrAction, 2> gripBtn{}, stickClick{}; // left, right
+  XrAction btnView = XR_NULL_HANDLE;               // the Steam Frame's left View button (aurora_xr_take_view_press)
   XrAction trigL = XR_NULL_HANDLE, trigR = XR_NULL_HANDLE;
   // The GameCube D-pad (up, down, left, right): the Steam Frame controller's.
   std::array<XrAction, 4> dpad{};
@@ -854,7 +857,10 @@ bool create_instance() {
   if (B.hasSpaceWarpExt)
     exts.push_back(XR_FB_SPACE_WARP_EXTENSION_NAME);
   // AURORA_XR_HANDS=0 leaves hand tracking off, for measuring what it costs.
-  B.hasHandTrackingExt &= env_flag("AURORA_XR_HANDS", true);
+  // Off by default where the runtime offers the Steam Frame's controllers:
+  // the Frame tracks no hands, and SteamVR's joints there are made up from
+  // the controllers, which would then point by pinching, not the trigger.
+  B.hasHandTrackingExt &= env_flag("AURORA_XR_HANDS", !B.hasFrameControllerExt);
   if (B.hasHandTrackingExt)
     exts.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
 #ifdef XR_META_boundary_visibility
@@ -2103,7 +2109,8 @@ bool create_input() {
       !create_action(B.dpad[0], "dpad_up", "D-pad up", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
       !create_action(B.dpad[1], "dpad_down", "D-pad down", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
       !create_action(B.dpad[2], "dpad_left", "D-pad left", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
-      !create_action(B.dpad[3], "dpad_right", "D-pad right", XR_ACTION_TYPE_BOOLEAN_INPUT))
+      !create_action(B.dpad[3], "dpad_right", "D-pad right", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.btnView, "view", "Room or skybox", XR_ACTION_TYPE_BOOLEAN_INPUT))
     return false;
   const bool rumble = create_action(B.rumble, "rumble", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT);
   const auto bindings = [](const std::vector<policy::Binding>& table) {
@@ -2175,6 +2182,9 @@ bool create_input() {
       case Act::DRight:
         a = B.dpad[3];
         break;
+      case Act::View:
+        a = B.btnView;
+        break;
       case Act::RumbleL:
       case Act::RumbleR:
         a = B.rumble;
@@ -2210,7 +2220,8 @@ bool create_input() {
         haptics |= withRumble;
         std::string kept;
         for (const auto& b : variant)
-          if (b.act == policy::Act::GripL || b.act == policy::Act::GripR || b.act == policy::Act::DUp)
+          if (b.act == policy::Act::GripL || b.act == policy::Act::GripR || b.act == policy::Act::DUp ||
+              b.act == policy::Act::View)
             kept += fmt::format("{}{}", kept.empty() ? "" : ", ", b.path);
         Log.info("Steam Frame controller bindings: {}{}", kept.empty() ? std::string{"no Z or D-pad"} : kept,
                  withRumble ? ", rumble" : ", no rumble");
@@ -2373,6 +2384,15 @@ void update_input() {
   dpad |= action_bool(B.dpad[1]) ? PAD_BUTTON_DOWN : 0;
   dpad |= action_bool(B.dpad[2]) ? PAD_BUTTON_LEFT : 0;
   dpad |= action_bool(B.dpad[3]) ? PAD_BUTTON_RIGHT : 0;
+  // The View button: no GameCube button; a press waits for the game to take it.
+  static bool viewWas = false;
+  const bool view = action_bool(B.btnView);
+  if (view && !viewWas) {
+    g_viewPressed = true;
+    if (env_flag("AURORA_XR_INPUT_LOG", false))
+      Log.info("XR View pressed");
+  }
+  viewWas = view;
   std::lock_guard lock{g_padMutex};
   g_touchRaw = raw;
   g_frameDpad = dpad;
@@ -4001,6 +4021,10 @@ void locate_hands(XrTime time) {
     static const bool inputLog = env_flag("AURORA_XR_INPUT_LOG", false);
     if (inputLog && hand.tracked != wasTracked)
       Log.info("{} hand: {}", h == 0 ? "Left" : "Right", hand.tracked ? "a tracked hand (pinches)" : "a controller");
+    if (inputLog && (hand.sel != hand.wasSel || hand.held != hand.wasHeld))
+      Log.info("{} hand: trigger {:.2f} {}, grip {:.2f} {}{}", h == 0 ? "Left" : "Right",
+               action_float(h == 0 ? B.trigL : B.trigR), hand.sel ? "down" : "up", action_float(B.grab[h]),
+               hand.held ? "down" : "up", hand.valid ? "" : " (not tracked)");
   }
 }
 
@@ -4186,6 +4210,9 @@ void update_screen(bool active) {
         engage(hand);
       } else if (hand.on == Hand::On::Picture && clickPressed(hand)) {
         hand.clicking = true;
+        static const bool inputLog = env_flag("AURORA_XR_INPUT_LOG", false);
+        if (inputLog)
+          Log.info("{} hand: clicks the screen", h == 0 ? "Left" : "Right");
       } else if (hand.on == Hand::On::Back && clickPressed(hand)) {
         hand.backing = true;
       }
@@ -13223,6 +13250,8 @@ extern "C" bool aurora_xr_screen_pointer(float* x, float* y, bool* pressed) {
   *pressed = p.pressed;
   return true;
 }
+
+extern "C" bool aurora_xr_take_view_press(void) { return aurora::xr::g_viewPressed.exchange(false); }
 
 extern "C" bool aurora_xr_screen_back(void) {
   std::lock_guard lock{aurora::xr::g_padMutex};

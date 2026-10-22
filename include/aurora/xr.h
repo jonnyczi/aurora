@@ -35,6 +35,11 @@ bool aurora_xr_screen_pointer(float* x, float* y, bool* pressed);
  * thread. */
 bool aurora_xr_screen_back(void);
 
+/* Whether the Steam Frame controller's View button (left) was pressed since
+ * the last call: each press is returned once. Never on controllers without
+ * one. Any thread. */
+bool aurora_xr_take_view_press(void);
+
 /* Draw categories for 3D fights (docs/xr-3d-plan.md). Everything drawn after
  * this call, until the next one, is tagged with the category.
  *   AURORA_XR_MONO   only the normal flat frame (the default every frame)
