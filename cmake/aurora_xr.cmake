@@ -14,7 +14,7 @@ set(AURORA_OPENXR_PROVIDER "auto" CACHE STRING
   "Desktop OpenXR SDK: auto (the system's if at least AURORA_OPENXR_SDK_VERSION, else vendor), system, vendor (build Khronos' OpenXR-SDK)")
 set_property(CACHE AURORA_OPENXR_PROVIDER PROPERTY STRINGS auto system vendor)
 
-target_sources(aurora_core PRIVATE lib/xr/xr.cpp)
+target_sources(aurora_core PRIVATE lib/xr/xr.cpp lib/xr/xr_policy.cpp)
 target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_OPENXR)
 if (AURORA_XR_DEFAULT_ON)
   target_compile_definitions(aurora_core PRIVATE AURORA_XR_DEFAULT_ON)
