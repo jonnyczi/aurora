@@ -91,6 +91,25 @@ TEST(XrPolicyPacing, NotMultiplesOf60) {
     EXPECT_EQ(per_game_frame(hz), 0) << hz;
 }
 
+TEST(XrPolicyPacing, PeriodChangeMustLast) {
+  constexpr int64_t k120 = 8333333, k60 = 16666667, k40 = 25000000;
+  PeriodWatch w;
+  EXPECT_TRUE(period_changed(w, k120, 0, 12)); // the first period counts at once
+  // SteamVR: one long frame now and then (seen at 120 Hz on the Steam Frame).
+  for (int i = 0; i < 50; ++i) {
+    EXPECT_FALSE(period_changed(w, i % 6 == 5 ? k60 : k120, k120, 12));
+    EXPECT_FALSE(period_changed(w, i % 9 == 8 ? k40 : k120, k120, 12));
+  }
+  // A change that lasts (SpaceWarp halving the loop) counts after 12 frames.
+  for (int i = 0; i < 11; ++i)
+    EXPECT_FALSE(period_changed(w, k60, k120, 12));
+  EXPECT_TRUE(period_changed(w, k60, k120, 12));
+  // Within 10%: no change.
+  EXPECT_FALSE(period_changed(w, k120 + 400000, k120, 1));
+  // Settling of 1: every change at once (as before).
+  EXPECT_TRUE(period_changed(w, k60, k120, 1));
+}
+
 TEST(XrPolicyPacing, RefreshPick) {
   // The Quest 3: 60 when offered, else 120.
   EXPECT_FLOAT_EQ(pick_refresh({72.f, 80.f, 90.f, 120.f}, 0.f), 120.f);

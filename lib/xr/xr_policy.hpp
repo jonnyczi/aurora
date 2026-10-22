@@ -60,6 +60,19 @@ float display_rate(float reportedHz, int64_t periodNs) noexcept;
 // timer).
 int per_game_frame(float rateHz) noexcept;
 
+// xrWaitFrame's predictedDisplayPeriod, watched for a change that lasts: a
+// period over 10% off the current one counts once it has held for
+// `settleFrames` frames running. SteamVR on the Steam Frame reports two or
+// three display frames' period now and then for a single frame, and pacing
+// re-planned on each flipped the game between one and two display frames per
+// game frame some 20 times a second. The first period (current 0) counts at
+// once.
+struct PeriodWatch {
+  int64_t candidate = 0;
+  int frames = 0;
+};
+bool period_changed(PeriodWatch& watch, int64_t period, int64_t current, int settleFrames) noexcept;
+
 // The refresh rate to request from those offered: wantedHz (AURORA_XR_REFRESH,
 // 0: none) if offered, else 60, else 120. 0: request nothing. A runtime that
 // lists just one rate (SteamVR on the Steam Frame lists the one it runs at,

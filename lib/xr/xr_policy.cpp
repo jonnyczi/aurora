@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace aurora::xr::policy {
@@ -51,6 +52,24 @@ float display_rate(float reportedHz, int64_t periodNs) noexcept {
 int per_game_frame(float rateHz) noexcept {
   const float ratio = rateHz / 60.f;
   return ratio >= 0.98f && std::abs(ratio - std::round(ratio)) < 0.02f ? static_cast<int>(std::round(ratio)) : 0;
+}
+
+bool period_changed(PeriodWatch& watch, int64_t period, int64_t current, int settleFrames) noexcept {
+  const auto near = [](int64_t a, int64_t b) { return std::llabs(a - b) * 10 <= b; };
+  if (current <= 0)
+    return period > 0;
+  if (period <= 0 || near(period, current)) {
+    watch = {};
+    return false;
+  }
+  if (watch.candidate == 0 || !near(period, watch.candidate)) {
+    watch.candidate = period;
+    watch.frames = 0;
+  }
+  if (++watch.frames < settleFrames)
+    return false;
+  watch = {};
+  return true;
 }
 
 float pick_refresh(const std::vector<float>& rates, float wantedHz) noexcept {
