@@ -821,7 +821,10 @@ bool create_instance() {
   // On wherever the runtime offers it, unless the host turned it off
   // (AuroraConfig::xrNoSpaceWarp; AURORA_XR_APPSW=0/1 overrides). Multiview
   // is decided later (with Dawn's device): size_stereo_stream.
-  B.hasSpaceWarpExt &= env_flag("AURORA_XR_APPSW", !g_config.xrNoSpaceWarp);
+  // Off by default on SteamVR (it offers the Steam Frame's controllers): it
+  // switches the loop between the display's rate and half of it every few
+  // frames there, and the game re-paced each time. AURORA_XR_APPSW=1 forces it.
+  B.hasSpaceWarpExt &= env_flag("AURORA_XR_APPSW", !g_config.xrNoSpaceWarp && !B.hasFrameControllerExt);
   if (B.hasSpaceWarpExt)
     exts.push_back(XR_FB_SPACE_WARP_EXTENSION_NAME);
   // AURORA_XR_HANDS=0 leaves hand tracking off, for measuring what it costs.
