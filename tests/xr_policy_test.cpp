@@ -28,11 +28,16 @@ TEST(XrPolicyRoom, QuestKeepsItsPassthroughLayer) {
   EXPECT_EQ(room_mode(true, false, RoomPref::Auto), Room::Fb);
   EXPECT_EQ(room_mode(true, true, RoomPref::Auto), Room::Fb);
   EXPECT_TRUE(try_fb_layer(RoomPref::Auto));
+  // Its room is a layer of its own, under the HUD, under the 3D view.
+  EXPECT_FALSE(fight_layer_first(Room::Fb));
+  EXPECT_FALSE(fight_layer_first(Room::None));
 }
 
 TEST(XrPolicyRoom, AlphaBlendWithoutTheLayer) {
   // The Steam Frame on the headset: no XR_FB_passthrough, ALPHA_BLEND offered.
   EXPECT_EQ(room_mode(false, true, RoomPref::Auto), Room::Alpha);
+  // SteamVR reprojects only the first layer: the 3D view goes there.
+  EXPECT_TRUE(fight_layer_first(Room::Alpha));
   // SteamVR streaming to a headset, or Monado: neither.
   EXPECT_EQ(room_mode(false, false, RoomPref::Auto), Room::None);
 }

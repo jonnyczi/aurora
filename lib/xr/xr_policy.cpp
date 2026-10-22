@@ -21,6 +21,8 @@ RoomPref parse_room_pref(const char* env) noexcept {
 
 bool try_fb_layer(RoomPref pref) noexcept { return pref == RoomPref::Auto || pref == RoomPref::Fb; }
 
+bool fight_layer_first(Room room) noexcept { return room == Room::Alpha; }
+
 Room room_mode(bool fbLayer, bool alphaOffered, RoomPref pref) noexcept {
   switch (pref) {
   case RoomPref::None:

@@ -8537,6 +8537,11 @@ bool render_xr_frame() {
   // behind one, and a menu frame has none of its own).
   const bool roomBlended = B.room == policy::Room::Alpha && g_passthroughWanted && B.frameViewsValid;
   const bool roomShown = (B.passthroughLayer && B.passthroughRunning && g_passthroughWanted) || roomBlended;
+  // The fight's 3D view first, under everything (policy::fight_layer_first):
+  // the room's layer then, see-through where nothing drew. AURORA_XR_FIGHT_FIRST
+  // =0/1 overrides the runtime's choice.
+  static const bool fightFirstOn = env_flag("AURORA_XR_FIGHT_FIRST", policy::fight_layer_first(B.room));
+  const bool fightFirst = fightFirstOn && fs.shouldRender && fight;
   if (roomBlended) {
     for (int i = 0; i < 2; ++i) {
       roomViews[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
@@ -8549,7 +8554,8 @@ bool render_xr_frame() {
     roomLayer.space = B.space;
     roomLayer.viewCount = 2;
     roomLayer.views = roomViews.data();
-    layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&roomLayer);
+    if (!fightFirst)
+      layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&roomLayer);
   } else if (roomShown) {
     ptLayer.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     ptLayer.layerHandle = B.passthroughLayer;
@@ -8557,7 +8563,8 @@ bool render_xr_frame() {
   }
   XrCompositionLayerQuad shadowQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
   XrCompositionLayerColorScaleBiasKHR shadowTint{XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
-  const bool shadow = build_shadow_layer(shadowQuad, shadowTint, fs.shouldRender && fight && roomShown);
+  // Not over a 3D view that goes first: it would cover the stage above it.
+  const bool shadow = build_shadow_layer(shadowQuad, shadowTint, fs.shouldRender && fight && roomShown && !fightFirst);
   // The room's grade, while a fight that isn't held for placing shows over it.
   grade_frame(fight && placing == 0 && roomShown);
   int shadowIndex = -1;
@@ -8657,7 +8664,7 @@ bool render_xr_frame() {
     // AURORA_XR_HUD_ON_TOP=1 keeps it on top in mixed reality too, as does
     // a stage whose scenery reaches it (aurora_xr_set_hud_on_top).
     static const bool hudOnTopEnv = env_flag("AURORA_XR_HUD_ON_TOP", false);
-    const bool hudUnder = g_passthroughWanted && !hudOnTopEnv && !g_hudOnTop;
+    const bool hudUnder = g_passthroughWanted && !hudOnTopEnv && !g_hudOnTop && !fightFirst;
     if (shadow) {
       shadowIndex = static_cast<int>(layerCount);
       layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&shadowQuad);
@@ -8738,6 +8745,8 @@ bool render_xr_frame() {
       if (refused++ < 5)
         Log.error("xrEndFrame failed: XrResult {} ({} layers); this frame shows the room alone",
                   static_cast<int>(r), layerCount);
+      if (roomBlended)
+        layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&roomLayer);
       fei.layerCount = roomShown ? 1 : 0;
       XR_TRY(ON_QUEUE(xrEndFrame(B.session, &fei)));
     }
