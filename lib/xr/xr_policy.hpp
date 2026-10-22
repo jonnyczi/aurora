@@ -37,6 +37,15 @@ bool try_fb_layer(RoomPref pref) noexcept;
 // lists ALPHA_BLEND for the stereo view configuration.
 Room room_mode(bool fbLayer, bool alphaOffered, RoomPref pref) noexcept;
 
+// Whether a fight's 3D view goes first, under every other layer. SteamVR
+// (blending) reprojects only a frame's first layer for the head: any later
+// projection layer is shown as drawn, and a 3D view drawn one to three display
+// frames before flickered between three places as the head moved. There the
+// 3D view, see-through where it drew nothing, is the room's layer too, with
+// the HUD above it. The Quest's room is a layer of its own, under the HUD,
+// under the 3D view.
+bool fight_layer_first(Room room) noexcept;
+
 // ---------------------------------------------------------------- pacing
 
 // The display's rate in Hz. reportedHz: XR_FB_display_refresh_rate's answer

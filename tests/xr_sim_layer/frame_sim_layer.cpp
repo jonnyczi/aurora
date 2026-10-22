@@ -28,8 +28,10 @@
 //   AURORA_SIM_RATES=a,b       the rates it lists.
 //
 // At xrDestroyInstance it logs (stderr, "frame_sim:") what it saw: frames,
-// frames blended without a projection layer first, the most swapchains
-// alive, refused creations, Frame suggestions accepted and refused.
+// frames blended without a projection layer first, frames with a projection
+// layer after the first layer (SteamVR reprojects only the first for the
+// head: a later one flickers as the head moves), the most swapchains alive,
+// refused creations, Frame suggestions accepted and refused.
 
 #include <openxr/openxr.h>
 #include <openxr/openxr_loader_negotiation.h>
@@ -106,7 +108,7 @@ struct State {
   std::mutex mutex;
   std::set<XrSwapchain> swapchains;
   int peakSwapchains = 0, refusedSwapchains = 0;
-  uint64_t frames = 0, blendedFrames = 0, blendedWithoutProjection = 0;
+  uint64_t frames = 0, blendedFrames = 0, blendedWithoutProjection = 0, laterProjectionFrames = 0;
   int frameAccepted = 0, frameRejected = 0;
   std::map<XrAction, std::vector<std::string>> frameBindings; // action -> Frame input paths
   bool profileEventPending = false;
@@ -172,10 +174,12 @@ bool pressed(const std::string& path) {
 
 XRAPI_ATTR XrResult XRAPI_CALL sim_DestroyInstance(XrInstance instance) {
   std::fprintf(stderr,
-               "frame_sim: %llu frames; %llu blended, %llu of them without a projection layer first; swapchains "
+               "frame_sim: %llu frames; %llu blended, %llu of them without a projection layer first; %llu with "
+               "a projection layer after the first; swapchains "
                "at most %d alive, %d refused; Frame bindings accepted %d, refused %d\n",
                static_cast<unsigned long long>(S.frames), static_cast<unsigned long long>(S.blendedFrames),
-               static_cast<unsigned long long>(S.blendedWithoutProjection), S.peakSwapchains, S.refusedSwapchains,
+               static_cast<unsigned long long>(S.blendedWithoutProjection),
+               static_cast<unsigned long long>(S.laterProjectionFrames), S.peakSwapchains, S.refusedSwapchains,
                S.frameAccepted, S.frameRejected);
   return S.destroyInstance(instance);
 }
@@ -228,6 +232,10 @@ XRAPI_ATTR XrResult XRAPI_CALL sim_EndFrame(XrSession session, const XrFrameEndI
       ++S.blendedFrames;
       if (info->layerCount == 0 || info->layers[0]->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION)
         ++S.blendedWithoutProjection;
+      bool later = false;
+      for (uint32_t i = 1; i < info->layerCount; ++i)
+        later |= info->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION;
+      S.laterProjectionFrames += later ? 1 : 0;
       if (S.blend)
         copy.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE; // what the runtime can show
     }
