@@ -80,21 +80,22 @@ bool joints_are_hand(Profile current) noexcept;
 
 // The pad's actions (lib/xr/xr.cpp maps them to XrActions).
 enum class Act {
-  Stick, CStick, A, B, X, Y, Z, Start, L, R, AimL, AimR, GrabL, GrabR, DUp, DDown, DLeft, DRight, RumbleL, RumbleR,
+  Stick, CStick, A, B, X, Y, GripL, GripR, StickClickL, StickClickR, Start, L, R, AimL, AimR, GrabL, GrabR, DUp, DDown, DLeft, DRight, RumbleL, RumbleR,
 };
 struct Binding {
   Act act;
   const char* path;
 };
 
-// Touch controllers, as on the Quest: either grip Z, the left menu button
-// Start. With haptics, rumble on both.
+// Touch controllers, as on the Quest: the grips and stick clicks as fight
+// inputs (the grips Z by default), the left menu button Start. With haptics, rumble on both.
 std::vector<Binding> touch_bindings(bool haptics);
 
 // The Steam Frame's controllers (XR_VALVE_frame_controller_interaction), in
 // the order to try: a suggestion with one path the runtime doesn't know is
 // rejected whole, and SteamVR renamed the shoulder buttons (bumper, before
-// 2.17.10). Shoulders Z, grips only grab, A/B/X/Y on the right controller,
+// 2.17.10). The shoulders fill the Touch fight table's grip inputs (Z by
+// default), the grips only grab, A/B/X/Y on the right controller,
 // the left D-pad the GameCube's, the right menu button Start; the first
 // variants with haptics.
 std::vector<std::vector<Binding>> frame_binding_variants();

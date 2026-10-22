@@ -179,6 +179,20 @@ void aurora_xr_set_room_light_held(bool vanilla);
  * reality, off for full VR, where passthrough is stopped, not just hidden.
  * On by default. Any thread. */
 void aurora_xr_set_passthrough(bool on);
+/* Whether the room can show at all: XR_FB_passthrough (the Quest), or the
+ * frame blended over it (the Steam Frame on the headset). False once a
+ * session has found neither (SteamVR streaming from a PC, Monado), so the
+ * game can show full VR's whole stages instead of a black room; true until
+ * then. Any thread. */
+bool aurora_xr_passthrough_available(void);
+
+/* What the player holds, for button legends (from the hands' interaction
+ * profiles; NONE until known, and for bare hands). Any thread. */
+#define AURORA_XR_CONTROLLERS_NONE 0
+#define AURORA_XR_CONTROLLERS_TOUCH 1 /* Meta Touch controllers (the Quest) */
+#define AURORA_XR_CONTROLLERS_FRAME 2 /* Steam Frame controllers */
+#define AURORA_XR_CONTROLLERS_OTHER 3
+int aurora_xr_controllers(void);
 
 /* The host's graphics settings as the game runs, in place of their
  * AuroraConfig values (xrNoStageShadow, xrEyeScale), each from its next

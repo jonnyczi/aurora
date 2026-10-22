@@ -129,15 +129,17 @@ TEST(XrPolicyInput, HandJoints) {
 TEST(XrPolicyInput, TouchBindingsAsBefore) {
   // The table the Quest has always had.
   const auto b = touch_bindings(false);
-  EXPECT_EQ(b.size(), 15u);
+  EXPECT_EQ(b.size(), 17u);
   EXPECT_TRUE(has(b, Act::Stick, "/user/hand/left/input/thumbstick"));
   EXPECT_TRUE(has(b, Act::CStick, "/user/hand/right/input/thumbstick"));
   EXPECT_TRUE(has(b, Act::A, "/user/hand/right/input/a/click"));
   EXPECT_TRUE(has(b, Act::B, "/user/hand/right/input/b/click"));
   EXPECT_TRUE(has(b, Act::X, "/user/hand/left/input/x/click"));
   EXPECT_TRUE(has(b, Act::Y, "/user/hand/left/input/y/click"));
-  EXPECT_TRUE(has(b, Act::Z, "/user/hand/left/input/squeeze/value"));
-  EXPECT_TRUE(has(b, Act::Z, "/user/hand/right/input/squeeze/value"));
+  EXPECT_TRUE(has(b, Act::GripL, "/user/hand/left/input/squeeze/value"));
+  EXPECT_TRUE(has(b, Act::GripR, "/user/hand/right/input/squeeze/value"));
+  EXPECT_TRUE(has(b, Act::StickClickL, "/user/hand/left/input/thumbstick/click"));
+  EXPECT_TRUE(has(b, Act::StickClickR, "/user/hand/right/input/thumbstick/click"));
   EXPECT_TRUE(has(b, Act::Start, "/user/hand/left/input/menu/click"));
   EXPECT_TRUE(has(b, Act::L, "/user/hand/left/input/trigger/value"));
   EXPECT_TRUE(has(b, Act::R, "/user/hand/right/input/trigger/value"));
@@ -147,7 +149,7 @@ TEST(XrPolicyInput, TouchBindingsAsBefore) {
   EXPECT_TRUE(has(b, Act::GrabR, "/user/hand/right/input/squeeze/value"));
   EXPECT_EQ(count(b, Act::DUp), 0);
   const auto h = touch_bindings(true);
-  EXPECT_EQ(h.size(), 17u);
+  EXPECT_EQ(h.size(), 19u);
   EXPECT_TRUE(has(h, Act::RumbleL, "/user/hand/left/output/haptic"));
   EXPECT_TRUE(has(h, Act::RumbleR, "/user/hand/right/output/haptic"));
 }
@@ -156,10 +158,11 @@ TEST(XrPolicyInput, FrameBindings) {
   const auto variants = frame_binding_variants();
   ASSERT_GE(variants.size(), 2u);
   const auto& best = variants.front();
-  // Shoulders are Z; the grips only grab.
-  EXPECT_TRUE(has(best, Act::Z, "/user/hand/left/input/bumper/click"));
-  EXPECT_TRUE(has(best, Act::Z, "/user/hand/right/input/bumper/click"));
-  EXPECT_FALSE(has(best, Act::Z, "/user/hand/left/input/squeeze/value"));
+  // The shoulders are the fight table's grip inputs (Z); the grips only grab.
+  EXPECT_TRUE(has(best, Act::GripL, "/user/hand/left/input/bumper/click"));
+  EXPECT_TRUE(has(best, Act::GripR, "/user/hand/right/input/bumper/click"));
+  EXPECT_FALSE(has(best, Act::GripL, "/user/hand/left/input/squeeze/value"));
+  EXPECT_TRUE(has(best, Act::StickClickL, "/user/hand/left/input/thumbstick/click"));
   EXPECT_TRUE(has(best, Act::GrabL, "/user/hand/left/input/squeeze/value"));
   EXPECT_TRUE(has(best, Act::GrabR, "/user/hand/right/input/squeeze/value"));
   // A/B/X/Y and Start on the right controller, the D-pad on the left.
@@ -175,10 +178,10 @@ TEST(XrPolicyInput, FrameBindings) {
     EXPECT_TRUE(has(best, act, path)) << path;
   EXPECT_EQ(count(best, Act::RumbleL), 1);
   // The rename: shoulder after bumper.
-  EXPECT_TRUE(has(variants[1], Act::Z, "/user/hand/left/input/shoulder/click"));
+  EXPECT_TRUE(has(variants[1], Act::GripL, "/user/hand/left/input/shoulder/click"));
   // The last resort binds nothing optional.
   const auto& last = variants.back();
-  EXPECT_EQ(count(last, Act::Z), 0);
+  EXPECT_EQ(count(last, Act::GripL), 0);
   EXPECT_EQ(count(last, Act::DUp), 0);
   EXPECT_EQ(count(last, Act::RumbleL), 0);
   EXPECT_EQ(count(last, Act::A), 1);

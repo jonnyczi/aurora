@@ -461,6 +461,11 @@ std::array<PlacingClip, 6> g_placingClips;
 // Set by the game (aurora_xr_set_passthrough): mixed reality shows the room,
 // full VR doesn't. The XR thread pauses or starts passthrough to match.
 std::atomic<bool> g_passthroughWanted{true};
+// Whether the room can show at all (aurora_xr_passthrough_available): -1
+// until the session has found out, then 0 or 1.
+std::atomic<int> g_roomAvailable{-1};
+// The controllers in the player's hands (aurora_xr_controllers).
+std::atomic<int> g_controllers{AURORA_XR_CONTROLLERS_NONE};
 
 // The game's rumble motor (aurora_xr_set_rumble); the XR thread drives the
 // controllers' haptics to match.
@@ -471,6 +476,8 @@ std::atomic<bool> g_rumbleWanted{false};
 // (aurora_xr_get_pad), through the fight mapping in a fight.
 std::mutex g_padMutex;
 PADFightRaw g_touchRaw{};
+// The Steam Frame's D-pad, as GameCube D-pad buttons (update_input).
+u16 g_frameDpad = 0;
 bool g_padValid = false;
 // Where a laser points on the virtual screen's picture, for the game
 // (aurora_xr_screen_pointer). Under g_padMutex.
@@ -600,6 +607,12 @@ struct Bridge {
   XrAction btnStart = XR_NULL_HANDLE;
   std::array<XrAction, 2> gripBtn{}, stickClick{}; // left, right
   XrAction trigL = XR_NULL_HANDLE, trigR = XR_NULL_HANDLE;
+  // The GameCube D-pad (up, down, left, right): the Steam Frame controller's.
+  std::array<XrAction, 4> dpad{};
+  // XR_VALVE_frame_controller_interaction (the Steam Frame's controllers),
+  // and what each hand holds now (xrGetCurrentInteractionProfile).
+  bool hasFrameControllerExt = false;
+  std::array<policy::Profile, 2> handProfile{policy::Profile::None, policy::Profile::None};
   // Pointing and grabbing the arena while a fight is paused.
   std::array<XrAction, 2> aim{}, grab{};
   std::array<XrSpace, 2> aimSpace{};
@@ -739,6 +752,10 @@ VkImageMemoryBarrier barrier(VkImage img, VkImageLayout from, VkImageLayout to, 
 
 // ---------------------------------------------------------------- XR thread: setup
 
+// The Steam Frame controller's interaction profile (SteamVR 2.15.1 and later),
+// newer than the OpenXR headers aurora builds with.
+constexpr const char* kFrameControllerExt = "XR_VALVE_frame_controller_interaction";
+
 bool create_instance() {
 #ifdef __ANDROID__
   auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
@@ -796,6 +813,7 @@ bool create_instance() {
 #ifdef XR_META_environment_depth
     B.hasEnvDepthExt |= !std::strcmp(p.extensionName, XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME);
 #endif
+    B.hasFrameControllerExt |= !std::strcmp(p.extensionName, kFrameControllerExt);
   }
   if (!hasVk2) {
     Log.error("OpenXR runtime lacks XR_KHR_vulkan_enable2");
@@ -849,6 +867,12 @@ bool create_instance() {
   B.hasLocalFloorExt &= env_flag("AURORA_XR_LOCAL_FLOOR", true);
   if (B.hasLocalFloorExt)
     exts.push_back(XR_EXT_LOCAL_FLOOR_EXTENSION_NAME);
+  // The Steam Frame's controllers, with their own bindings (create_input)
+  // rather than SteamVR's emulation of Touch controllers.
+  // AURORA_XR_FRAME_BINDINGS=0 leaves them to the emulation.
+  B.hasFrameControllerExt &= env_flag("AURORA_XR_FRAME_BINDINGS", true);
+  if (B.hasFrameControllerExt)
+    exts.push_back(kFrameControllerExt);
   // The room's grade by colour LUT; without it, brightness, contrast and
   // saturation (AURORA_XR_GRADE_LUT=0 forces those, AURORA_XR_GRADE=0 none).
   B.hasColorLutExt &= B.hasPassthroughExt && grade_wanted() &&
@@ -1937,6 +1961,33 @@ bool suggest(const char* profile, const std::vector<std::pair<XrAction, const ch
   return XR_SUCCEEDED(r);
 }
 
+// What each hand holds (after the action set is attached, and when the
+// runtime says it changed): whether its tracked joints are a bare hand
+// (locate_pinch), and which legend the placing hold shows (aurora_xr_controllers).
+void update_hand_profiles() {
+  for (int h = 0; h < 2; ++h) {
+    XrInteractionProfileState st{XR_TYPE_INTERACTION_PROFILE_STATE};
+    std::string name;
+    if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(B.session, path(h == 0 ? "/user/hand/left" : "/user/hand/right"),
+                                                    &st)) &&
+        st.interactionProfile != XR_NULL_PATH) {
+      char buf[XR_MAX_PATH_LENGTH];
+      uint32_t n = 0;
+      if (XR_SUCCEEDED(xrPathToString(B.instance, st.interactionProfile, sizeof buf, &n, buf)))
+        name = buf;
+    }
+    const auto kind = policy::classify_profile(name);
+    if (kind != B.handProfile[h])
+      Log.info("{} hand: {}", h == 0 ? "Left" : "Right", name.empty() ? std::string{"nothing"} : name);
+    B.handProfile[h] = kind;
+  }
+  const auto either = [](policy::Profile p) { return B.handProfile[0] == p || B.handProfile[1] == p; };
+  g_controllers = either(policy::Profile::Frame) ? AURORA_XR_CONTROLLERS_FRAME
+                  : either(policy::Profile::Touch) ? AURORA_XR_CONTROLLERS_TOUCH
+                  : either(policy::Profile::OtherController) ? AURORA_XR_CONTROLLERS_OTHER
+                                                              : AURORA_XR_CONTROLLERS_NONE;
+}
+
 bool create_input() {
   XrActionSetCreateInfo asi{XR_TYPE_ACTION_SET_CREATE_INFO};
   std::strncpy(asi.actionSetName, "gamecube", XR_MAX_ACTION_SET_NAME_SIZE - 1);
@@ -1958,43 +2009,82 @@ bool create_input() {
       !create_action(B.aim[0], "aim_left", "Left pointer", XR_ACTION_TYPE_POSE_INPUT) ||
       !create_action(B.aim[1], "aim_right", "Right pointer", XR_ACTION_TYPE_POSE_INPUT) ||
       !create_action(B.grab[0], "grab_left", "Left grab", XR_ACTION_TYPE_FLOAT_INPUT) ||
-      !create_action(B.grab[1], "grab_right", "Right grab", XR_ACTION_TYPE_FLOAT_INPUT))
+      !create_action(B.grab[1], "grab_right", "Right grab", XR_ACTION_TYPE_FLOAT_INPUT) ||
+      !create_action(B.dpad[0], "dpad_up", "D-pad up", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.dpad[1], "dpad_down", "D-pad down", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.dpad[2], "dpad_left", "D-pad left", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.dpad[3], "dpad_right", "D-pad right", XR_ACTION_TYPE_BOOLEAN_INPUT))
     return false;
-
-  std::vector<std::pair<XrAction, const char*>> touchBindings{
-      {B.stickMain, "/user/hand/left/input/thumbstick"},
-      {B.stickC, "/user/hand/right/input/thumbstick"},
-      {B.btnA, "/user/hand/right/input/a/click"},
-      {B.btnB, "/user/hand/right/input/b/click"},
-      {B.btnX, "/user/hand/left/input/x/click"},
-      {B.btnY, "/user/hand/left/input/y/click"},
-      {B.gripBtn[0], "/user/hand/left/input/squeeze/value"},
-      {B.gripBtn[1], "/user/hand/right/input/squeeze/value"},
-      {B.stickClick[0], "/user/hand/left/input/thumbstick/click"},
-      {B.stickClick[1], "/user/hand/right/input/thumbstick/click"},
-      {B.btnStart, "/user/hand/left/input/menu/click"},
-      {B.trigL, "/user/hand/left/input/trigger/value"},
-      {B.trigR, "/user/hand/right/input/trigger/value"},
-      {B.aim[0], "/user/hand/left/input/aim/pose"},
-      {B.aim[1], "/user/hand/right/input/aim/pose"},
-      {B.grab[0], "/user/hand/left/input/squeeze/value"},
-      {B.grab[1], "/user/hand/right/input/squeeze/value"},
+  const bool rumble = create_action(B.rumble, "rumble", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT);
+  const auto bindings = [](const std::vector<policy::Binding>& table) {
+    std::vector<std::pair<XrAction, const char*>> out;
+    for (const auto& [act, binding] : table) {
+      using policy::Act;
+      XrAction a = XR_NULL_HANDLE;
+      switch (act) {
+      case Act::Stick: a = B.stickMain; break;
+      case Act::CStick: a = B.stickC; break;
+      case Act::A: a = B.btnA; break;
+      case Act::B: a = B.btnB; break;
+      case Act::X: a = B.btnX; break;
+      case Act::Y: a = B.btnY; break;
+      case Act::GripL: a = B.gripBtn[0]; break;
+      case Act::GripR: a = B.gripBtn[1]; break;
+      case Act::StickClickL: a = B.stickClick[0]; break;
+      case Act::StickClickR: a = B.stickClick[1]; break;
+      case Act::Start: a = B.btnStart; break;
+      case Act::L: a = B.trigL; break;
+      case Act::R: a = B.trigR; break;
+      case Act::AimL: a = B.aim[0]; break;
+      case Act::AimR: a = B.aim[1]; break;
+      case Act::GrabL: a = B.grab[0]; break;
+      case Act::GrabR: a = B.grab[1]; break;
+      case Act::DUp: a = B.dpad[0]; break;
+      case Act::DDown: a = B.dpad[1]; break;
+      case Act::DLeft: a = B.dpad[2]; break;
+      case Act::DRight: a = B.dpad[3]; break;
+      case Act::RumbleL:
+      case Act::RumbleR: a = B.rumble; break;
+      }
+      out.emplace_back(a, binding);
+    }
+    return out;
   };
+
   // The game's rumble on both controllers' haptics. Suggested with the pad's
   // bindings (a later suggestion for a profile replaces the earlier one), and
   // the pad alone again if the runtime turns that down.
-  bool touch = false;
-  if (create_action(B.rumble, "rumble", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT)) {
-    auto withHaptics = touchBindings;
-    withHaptics.push_back({B.rumble, "/user/hand/left/output/haptic"});
-    withHaptics.push_back({B.rumble, "/user/hand/right/output/haptic"});
-    touch = suggest("/interaction_profiles/oculus/touch_controller", withHaptics);
-  }
+  bool touch = rumble && suggest("/interaction_profiles/oculus/touch_controller", bindings(policy::touch_bindings(true)));
+  bool haptics = touch;
   if (!touch) {
-    B.rumble = XR_NULL_HANDLE;
     Log.warn("Touch controller haptics not bound: no rumble");
-    touch = suggest("/interaction_profiles/oculus/touch_controller", touchBindings);
+    touch = suggest("/interaction_profiles/oculus/touch_controller", bindings(policy::touch_bindings(false)));
   }
+  // The Steam Frame's controllers: shoulders Z, grips only grab, A/B/X/Y and
+  // Start on the right, the D-pad on the left. The first variant the runtime
+  // takes (it rejects a whole suggestion over one path it doesn't know).
+  bool frame = false;
+  if (B.hasFrameControllerExt) {
+    for (const auto& variant : policy::frame_binding_variants()) {
+      const bool withRumble = std::any_of(variant.begin(), variant.end(),
+                                          [](const policy::Binding& b) { return b.act == policy::Act::RumbleL; });
+      if (withRumble && !rumble)
+        continue;
+      if (suggest("/interaction_profiles/valve/frame_controller_valve", bindings(variant))) {
+        frame = true;
+        haptics |= withRumble;
+        std::string kept;
+        for (const auto& b : variant)
+          if (b.act == policy::Act::GripL || b.act == policy::Act::GripR || b.act == policy::Act::DUp)
+            kept += fmt::format("{}{}", kept.empty() ? "" : ", ", b.path);
+        Log.info("Steam Frame controller bindings: {}{}", kept.empty() ? std::string{"no Z or D-pad"} : kept,
+                 withRumble ? ", rumble" : ", no rumble");
+        break;
+      }
+    }
+  }
+  if (!haptics)
+    B.rumble = XR_NULL_HANDLE;
   // Pointing and grabbing only, no pad buttons: the Quest reports bare
   // hands as this profile, select being a pinch, and a pinch must grab,
   // not press A or B. (Monado's keyboard/mouse controllers come through it
@@ -2015,7 +2105,9 @@ bool create_input() {
     asci.poseInActionSpace.orientation.w = 1.f;
     XR_TRY(xrCreateActionSpace(B.session, &asci, &B.aimSpace[h]));
   }
-  Log.info("Controller input ready ({})", touch ? "Touch controller bindings" : "simple controller only");
+  Log.info("Controller input ready ({}{})", touch ? "Touch controller bindings" : "simple controller only",
+           frame ? ", Steam Frame controller bindings" : "");
+  update_hand_profiles();
   return true;
 }
 
@@ -2139,8 +2231,16 @@ void update_input() {
   press(l > 0.9f, PAD_FIGHT_LEFT_TRIGGER);
   press(r > 0.9f, PAD_FIGHT_RIGHT_TRIGGER);
   raw.start = action_bool(B.btnStart);
+  // The Steam Frame's D-pad: no input of the Touch fight table, so the
+  // GameCube's D-pad as it is, added after the table (aurora_xr_get_pad).
+  u16 dpad = 0;
+  dpad |= action_bool(B.dpad[0]) ? PAD_BUTTON_UP : 0;
+  dpad |= action_bool(B.dpad[1]) ? PAD_BUTTON_DOWN : 0;
+  dpad |= action_bool(B.dpad[2]) ? PAD_BUTTON_LEFT : 0;
+  dpad |= action_bool(B.dpad[3]) ? PAD_BUTTON_RIGHT : 0;
   std::lock_guard lock{g_padMutex};
   g_touchRaw = raw;
+  g_frameDpad = dpad;
   g_padValid = true;
 }
 
@@ -3625,6 +3725,10 @@ constexpr float kPinchClose = 0.02f, kPinchOpen = 0.035f;
 bool locate_pinch(int h, XrTime time, Hand& hand) {
   if (!B.handTrackers[h])
     return false;
+  // SteamVR reports joints for a hand holding a controller, from the
+  // controller: that hand points and grabs with the controller.
+  if (!policy::joints_are_hand(B.handProfile[h]))
+    return false;
   std::array<XrHandJointLocationEXT, XR_HAND_JOINT_COUNT_EXT> joints{};
   XrHandJointLocationsEXT locs{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
   locs.jointCount = static_cast<uint32_t>(joints.size());
@@ -3702,6 +3806,9 @@ void locate_hands(XrTime time) {
     }
     if (hand.tracked || !hand.valid)
       hand.sel = false;
+    static const bool inputLog = env_flag("AURORA_XR_INPUT_LOG", false);
+    if (inputLog && hand.tracked != wasTracked)
+      Log.info("{} hand: {}", h == 0 ? "Left" : "Right", hand.tracked ? "a tracked hand (pinches)" : "a controller");
   }
 }
 
@@ -10054,6 +10161,8 @@ bool poll_events() {
       // the stage spot's anchor
     } else if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
       update_pacing();
+    } else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+      update_hand_profiles();
     } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
       return false;
 #ifdef XR_META_boundary_visibility
@@ -12829,11 +12938,13 @@ extern "C" void aurora_xr_set_rumble(bool on) {
 
 extern "C" bool aurora_xr_get_pad(PADStatus* out) {
   PADFightRaw raw;
+  u16 dpad = 0;
   {
     std::lock_guard lock{aurora::xr::g_padMutex};
     if (!aurora::xr::g_padValid)
       return false;
     raw = aurora::xr::g_touchRaw;
+    dpad = aurora::xr::g_frameDpad;
   }
   // Through the fight mapping in a fight (PADSetFightMappingActive), the
   // usual one otherwise: the sticks at full scale, the triggers' analog
@@ -12844,6 +12955,13 @@ extern "C" bool aurora_xr_get_pad(PADStatus* out) {
   aurora::pad::fight_compose(PAD_FIGHT_DEVICE_TOUCH, raw,
                              PADFightMappingActive() ? nullptr : aurora::pad::fight_standard(PAD_FIGHT_DEVICE_TOUCH),
                              127.f, 127.f, 0, *out);
+  out->button |= dpad;
+  // AURORA_XR_INPUT_LOG=1: the pad's buttons whenever they change.
+  static const bool inputLog = aurora::xr::env_flag("AURORA_XR_INPUT_LOG", false);
+  static u16 lastButtons = 0;
+  if (inputLog && out->button != lastButtons)
+    aurora::xr::Log.info("XR pad buttons {:#06x}", out->button);
+  lastButtons = out->button;
   return true;
 }
 
@@ -13018,6 +13136,8 @@ extern "C" void aurora_xr_set_room_light_held(bool vanilla) {
 }
 
 extern "C" void aurora_xr_set_passthrough(bool on) { aurora::xr::g_passthroughWanted = on; }
+extern "C" bool aurora_xr_passthrough_available(void) { return aurora::xr::g_roomAvailable != 0; }
+extern "C" int aurora_xr_controllers(void) { return aurora::xr::g_controllers.load(std::memory_order_relaxed); }
 
 extern "C" void aurora_xr_set_stage_shadow(bool on) { aurora::xr::g_stageShadow = on ? 1 : 0; }
 

@@ -95,8 +95,10 @@ std::vector<Binding> touch_bindings(bool haptics) {
       {Act::B, "/user/hand/right/input/b/click"},
       {Act::X, "/user/hand/left/input/x/click"},
       {Act::Y, "/user/hand/left/input/y/click"},
-      {Act::Z, "/user/hand/left/input/squeeze/value"},
-      {Act::Z, "/user/hand/right/input/squeeze/value"},
+      {Act::GripL, "/user/hand/left/input/squeeze/value"},
+      {Act::GripR, "/user/hand/right/input/squeeze/value"},
+      {Act::StickClickL, "/user/hand/left/input/thumbstick/click"},
+      {Act::StickClickR, "/user/hand/right/input/thumbstick/click"},
       {Act::Start, "/user/hand/left/input/menu/click"},
       {Act::L, "/user/hand/left/input/trigger/value"},
       {Act::R, "/user/hand/right/input/trigger/value"},
@@ -117,6 +119,8 @@ std::vector<std::vector<Binding>> frame_binding_variants() {
     std::vector<Binding> b{
         {Act::Stick, "/user/hand/left/input/thumbstick"},
         {Act::CStick, "/user/hand/right/input/thumbstick"},
+        {Act::StickClickL, "/user/hand/left/input/thumbstick/click"},
+        {Act::StickClickR, "/user/hand/right/input/thumbstick/click"},
         {Act::A, "/user/hand/right/input/a/click"},
         {Act::B, "/user/hand/right/input/b/click"},
         {Act::X, "/user/hand/right/input/x/click"},
@@ -129,11 +133,12 @@ std::vector<std::vector<Binding>> frame_binding_variants() {
         {Act::GrabL, "/user/hand/left/input/squeeze/value"},
         {Act::GrabR, "/user/hand/right/input/squeeze/value"},
     };
-    // Both hands' shoulder buttons press Z (the GameCube's is a shoulder button).
+    // The shoulder buttons are the fight table's grip inputs, Z by default
+    // (the GameCube's Z is a shoulder button).
     if (shoulder != nullptr) {
       const bool bumper = std::strcmp(shoulder, "bumper") == 0;
-      b.push_back({Act::Z, bumper ? "/user/hand/left/input/bumper/click" : "/user/hand/left/input/shoulder/click"});
-      b.push_back({Act::Z, bumper ? "/user/hand/right/input/bumper/click" : "/user/hand/right/input/shoulder/click"});
+      b.push_back({Act::GripL, bumper ? "/user/hand/left/input/bumper/click" : "/user/hand/left/input/shoulder/click"});
+      b.push_back({Act::GripR, bumper ? "/user/hand/right/input/bumper/click" : "/user/hand/right/input/shoulder/click"});
     }
     if (dpad) {
       b.push_back({Act::DUp, "/user/hand/left/input/dpad_up/click"});
