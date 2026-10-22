@@ -14,12 +14,29 @@ set(AURORA_OPENXR_PROVIDER "auto" CACHE STRING
   "Desktop OpenXR SDK: auto (the system's if at least AURORA_OPENXR_SDK_VERSION, else vendor), system, vendor (build Khronos' OpenXR-SDK)")
 set_property(CACHE AURORA_OPENXR_PROVIDER PROPERTY STRINGS auto system vendor)
 
-target_sources(aurora_core PRIVATE lib/xr/xr.cpp lib/xr/xr_policy.cpp)
+target_sources(aurora_core PRIVATE lib/xr/xr.cpp lib/xr/xr_policy.cpp lib/webgpu/queue_guard.cpp)
 target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_OPENXR)
 if (AURORA_XR_DEFAULT_ON)
   target_compile_definitions(aurora_core PRIVATE AURORA_XR_DEFAULT_ON)
 endif ()
 
+# One Vulkan queue shared by Dawn and the OpenXR runtime, where the GPU's
+# graphics family has no spare (Turnip on the Steam Frame, RADV): every Dawn
+# entry point that can reach the queue holds lib/webgpu/queue_guard.hpp's
+# lock, for every caller (aurora, the ImGui and RmlUi backends, the game),
+# by wrapping them at link time. Linux only; elsewhere a GPU without a spare
+# queue keeps presenting to the window.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+  target_compile_definitions(aurora_core PRIVATE AURORA_QUEUE_GUARD_WRAP)
+  foreach (_sym IN ITEMS
+      wgpuQueueSubmit wgpuQueueWriteBuffer wgpuQueueWriteTexture wgpuQueueOnSubmittedWorkDone
+      wgpuBufferMapAsync wgpuBufferUnmap wgpuBufferDestroy
+      wgpuInstanceProcessEvents wgpuInstanceWaitAny wgpuDeviceTick wgpuDeviceDestroy wgpuDeviceRelease
+      wgpuSurfacePresent wgpuSurfaceGetCurrentTexture wgpuSurfaceConfigure wgpuSurfaceUnconfigure
+      wgpuSharedTextureMemoryBeginAccess wgpuSharedTextureMemoryEndAccess)
+    target_link_options(aurora_core INTERFACE "LINKER:--wrap=${_sym}")
+  endforeach ()
+endif ()
 
 if (ANDROID)
   set(_xr_dir "${CMAKE_BINARY_DIR}/_deps/openxr_loader_android-${AURORA_OPENXR_ANDROID_VERSION}")

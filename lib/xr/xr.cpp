@@ -8,6 +8,8 @@
 #include "../gfx/recording.hpp"
 #include "../gfx/xr_replay.hpp"
 #include "../gx/gx.hpp"
+#include "../webgpu/queue_guard.hpp"
+#include "xr_policy.hpp"
 
 #include <aurora/gfx.hpp>
 
@@ -476,6 +478,9 @@ struct Bridge {
   VkQueue queue = VK_NULL_HANDLE;
   uint32_t queueFamily = 0;
   uint32_t queueIndex = 1;
+  // The family has no spare queue (Turnip, RADV): the runtime and the XR
+  // thread share Dawn's, under lib/webgpu/queue_guard.hpp's lock.
+  bool sharedQueue = false;
   VkCommandPool pool = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memProps{};
   PFN_vkImportSemaphoreFdKHR importSemaphoreFd = nullptr;
@@ -634,6 +639,10 @@ Bridge B;
       return false;                                                                                                    \
     }                                                                                                                  \
   } while (0)
+// Vulkan and OpenXR calls that may use the queue the runtime has (Dawn's,
+// when it is shared: lib/webgpu/queue_guard.hpp). The XR thread's waits for
+// the lock are counted.
+#define ON_QUEUE(x) [&] { const webgpu::QueueGuard queueGuard_{true}; return (x); }()
 
 bool env_flag(const char* name, bool def) {
   const char* v = std::getenv(name);
@@ -1089,7 +1098,7 @@ bool create_swapchain(Stream& st) {
   ci.faceCount = 1;
   ci.arraySize = st.layers;
   ci.mipCount = 1;
-  XR_TRY(xrCreateSwapchain(B.session, &ci, &st.swapchain));
+  XR_TRY(ON_QUEUE(xrCreateSwapchain(B.session, &ci, &st.swapchain)));
   uint32_t n = 0;
   XR_TRY(xrEnumerateSwapchainImages(st.swapchain, 0, &n, nullptr));
   std::vector<XrSwapchainImageVulkan2KHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
@@ -1256,7 +1265,7 @@ bool create_session() {
   XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
   sci.next = &gb;
   sci.systemId = B.systemId;
-  XR_TRY(xrCreateSession(B.instance, &sci, &B.session));
+  XR_TRY(ON_QUEUE(xrCreateSession(B.instance, &sci, &B.session)));
 
   XrReferenceSpaceCreateInfo rsci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
   rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -1690,7 +1699,7 @@ bool acquire_ahead(Stream& st, int64_t waitNs = 2'000'000) {
                            &st == &g_streams[kMotionDepth]);
   if (pending < 0 && held < st.slots.size() && (!haveWaited || preAcquire)) {
     uint32_t index = 0;
-    XR_TRY(xrAcquireSwapchainImage(st.swapchain, nullptr, &index));
+    XR_TRY(ON_QUEUE(xrAcquireSwapchainImage(st.swapchain, nullptr, &index)));
     std::lock_guard lock{g_mutex};
     st.slots[index].state = SlotState::Acquired;
     st.slots[index].acquireSeq = ++st.acquireSeq;
@@ -2359,11 +2368,11 @@ bool release_ready(Stream& st, bool& released) {
     si.pWaitDstStageMask = stages.data();
     si.commandBufferCount = record ? 1 : 0;
     si.pCommandBuffers = &s.cmd;
-    VK_TRY(vkQueueSubmit(B.queue, 1, &si, s.fence));
+    VK_TRY(ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, s.fence)));
     s.inFlight = true;
     if (&st == &g_streams[kStereo])
       trace_counter("XR 3D released", static_cast<int64_t>(st.releases & 1));
-    XR_TRY(xrReleaseSwapchainImage(st.swapchain, nullptr));
+    XR_TRY(ON_QUEUE(xrReleaseSwapchainImage(st.swapchain, nullptr)));
     {
       std::lock_guard lock{g_mutex};
       s.state = SlotState::Released;
@@ -2492,7 +2501,7 @@ bool release_staged(Stream& st, bool& released) {
       si.waitSemaphoreCount = static_cast<uint32_t>(r.waitSems.size());
       si.pWaitSemaphores = r.waitSems.data();
       si.pWaitDstStageMask = stages.data();
-      VK_TRY(vkQueueSubmit(B.queue, 1, &si, r.fence));
+      VK_TRY(ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, r.fence)));
       {
         std::lock_guard lock{g_mutex};
         r.inFlight = true;
@@ -2568,14 +2577,14 @@ bool release_staged(Stream& st, bool& released) {
     si.pWaitDstStageMask = stages.data();
     si.commandBufferCount = 1;
     si.pCommandBuffers = &r.cmd;
-    VK_TRY(vkQueueSubmit(B.queue, 1, &si, r.fence));
+    VK_TRY(ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, r.fence)));
     {
       std::lock_guard lock{g_mutex};
       r.inFlight = true;
     }
     if (&st == &g_streams[kStereo])
       trace_counter("XR 3D released", static_cast<int64_t>(st.releases & 1));
-    XR_TRY(xrReleaseSwapchainImage(st.swapchain, nullptr));
+    XR_TRY(ON_QUEUE(xrReleaseSwapchainImage(st.swapchain, nullptr)));
     {
       std::lock_guard lock{g_mutex};
       s.state = SlotState::Released;
@@ -3523,9 +3532,9 @@ bool create_static_swapchain(XrSwapchain& out, uint32_t w, uint32_t h, const std
   ci.faceCount = 1;
   ci.arraySize = layers;
   ci.mipCount = 1;
-  if (XR_FAILED(xrCreateSwapchain(B.session, &ci, &out))) {
+  if (XR_FAILED(ON_QUEUE(xrCreateSwapchain(B.session, &ci, &out)))) {
     ci.createFlags = 0;
-    XR_TRY(xrCreateSwapchain(B.session, &ci, &out));
+    XR_TRY(ON_QUEUE(xrCreateSwapchain(B.session, &ci, &out)));
   }
   uint32_t n = 0;
   XR_TRY(xrEnumerateSwapchainImages(out, 0, &n, nullptr));
@@ -3560,7 +3569,7 @@ bool create_static_swapchain(XrSwapchain& out, uint32_t w, uint32_t h, const std
 
     uint32_t index = 0;
     XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XR_TRY(xrAcquireSwapchainImage(out, &ai, &index));
+    XR_TRY(ON_QUEUE(xrAcquireSwapchainImage(out, &ai, &index)));
     XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wi.timeout = XR_INFINITE_DURATION;
     XR_TRY(xrWaitSwapchainImage(out, &wi));
@@ -3608,9 +3617,9 @@ bool create_static_swapchain(XrSwapchain& out, uint32_t w, uint32_t h, const std
     // Not waited on: this queue also carries the stream releases, which
     // wait on the render worker, which can wait on this thread. The staging
     // buffer goes once the fence signals.
-    VK_TRY(vkQueueSubmit(B.queue, 1, &si, fence));
+    VK_TRY(ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, fence)));
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    XR_TRY(xrReleaseSwapchainImage(out, &ri));
+    XR_TRY(ON_QUEUE(xrReleaseSwapchainImage(out, &ri)));
     B.uploads.push_back({buf, mem, cmd, fence});
     buf = VK_NULL_HANDLE;
     mem = VK_NULL_HANDLE;
@@ -7844,7 +7853,7 @@ void update_dev_panel(bool show, bool tintUsable) {
 bool build_dev_panel_layer(XrCompositionLayerQuad& q) {
   const auto now = std::chrono::steady_clock::now();
   while (!P.retired.empty() && now - P.retired.front().second > std::chrono::milliseconds(500)) {
-    xrDestroySwapchain(P.retired.front().first);
+    ON_QUEUE(xrDestroySwapchain(P.retired.front().first));
     P.retired.pop_front();
   }
   if (!P.shown)
@@ -7882,10 +7891,10 @@ bool build_dev_panel_layer(XrCompositionLayerQuad& q) {
 
 void destroy_dev_panel() {
   for (auto& r : P.retired)
-    xrDestroySwapchain(r.first);
+    ON_QUEUE(xrDestroySwapchain(r.first));
   P.retired.clear();
   if (P.image.swapchain)
-    xrDestroySwapchain(P.image.swapchain);
+    ON_QUEUE(xrDestroySwapchain(P.image.swapchain));
   P.image.swapchain = XR_NULL_HANDLE;
   P.shown = false;
   P.active = P.activeHand = -1;
@@ -8109,7 +8118,7 @@ bool render_xr_frame() {
     B.sectionNs[9 + i] = pre[i + 1] - pre[i];
   {
     TraceSection trace{"xrBeginFrame"};
-    XR_TRY(xrBeginFrame(B.session, nullptr));
+    XR_TRY(ON_QUEUE(xrBeginFrame(B.session, nullptr)));
   }
   section(0);
 
@@ -8416,13 +8425,13 @@ bool render_xr_frame() {
     TraceSection trace{"xrEndFrame"};
     // A frame the runtime refuses (a layer it finds invalid) is ended again
     // with the room alone, rather than ending the XR thread over it.
-    if (const XrResult r = xrEndFrame(B.session, &fei); XR_FAILED(r)) {
+    if (const XrResult r = ON_QUEUE(xrEndFrame(B.session, &fei)); XR_FAILED(r)) {
       static int refused = 0;
       if (refused++ < 5)
         Log.error("xrEndFrame failed: XrResult {} ({} layers); this frame shows the room alone",
                   static_cast<int>(r), layerCount);
       fei.layerCount = roomShown ? 1 : 0;
-      XR_TRY(xrEndFrame(B.session, &fei));
+      XR_TRY(ON_QUEUE(xrEndFrame(B.session, &fei)));
     }
   }
   section(8);
@@ -8486,6 +8495,13 @@ bool render_xr_frame() {
              g_acquireWaitMaxNs[kStereo] / 1e6, g_acquireWaitsOver2[kStereo],
              g_acquireWaitMaxNs[kHud] / 1e6, g_acquireWaitsOver2[kHud], g_acquireWaitMaxNs[kScreen] / 1e6,
              g_acquireWaitsOver2[kScreen], pace_summary());
+    if (B.sharedQueue) {
+      int64_t waitMaxNs = 0;
+      uint32_t waitsOver1 = 0;
+      webgpu::queue_guard_waits(waitMaxNs, waitsOver1);
+      Log.info("Shared queue: the XR thread waited for it {:.2f} ms at most, {} times over 1 ms", waitMaxNs / 1e6,
+               waitsOver1);
+    }
     g_acquireWaitMaxNs = {};
     g_acquireWaitsOver2 = {};
     g_missWhy = {};
@@ -8636,7 +8652,7 @@ void teardown() {
   // Only our queue: Dawn may be submitting on its own, and vkDeviceWaitIdle
   // would need every queue externally synchronized.
   if (B.queue)
-    vkQueueWaitIdle(B.queue);
+    ON_QUEUE(vkQueueWaitIdle(B.queue));
   if (B.dev)
     free_finished_uploads(true);
   if (B.dev) {
@@ -8666,7 +8682,7 @@ void teardown() {
   for (XrSwapchain* sc : {&B.beamSwapchain, &B.dotSwapchain, &B.barSwapchain, &B.backSwapchain,
                           &B.zeroMotionSwapchain, &B.shadowSwapchain}) {
     if (*sc)
-      xrDestroySwapchain(*sc);
+      ON_QUEUE(xrDestroySwapchain(*sc));
     *sc = XR_NULL_HANDLE;
   }
   destroy_dev_panel();
@@ -8674,12 +8690,12 @@ void teardown() {
     std::lock_guard lock{g_placingMutex};
     for (auto& clip : g_placingClips) {
       if (clip.atlas.swapchain)
-        xrDestroySwapchain(clip.atlas.swapchain);
+        ON_QUEUE(xrDestroySwapchain(clip.atlas.swapchain));
       clip.atlas.swapchain = XR_NULL_HANDLE;
     }
     for (auto& img : g_placingImages) {
       if (img.swapchain)
-        xrDestroySwapchain(img.swapchain);
+        ON_QUEUE(xrDestroySwapchain(img.swapchain));
       img.swapchain = XR_NULL_HANDLE;
     }
   }
@@ -8700,7 +8716,7 @@ void teardown() {
   // stopped (Phase::Failed or g_stop) before this runs.
   for (auto& st : g_streams) {
     if (st.swapchain)
-      xrDestroySwapchain(st.swapchain);
+      ON_QUEUE(xrDestroySwapchain(st.swapchain));
     st.swapchain = XR_NULL_HANDLE;
   }
   if (B.floorSpace)
@@ -8709,7 +8725,7 @@ void teardown() {
   if (B.space)
     xrDestroySpace(B.space);
   if (B.session)
-    xrDestroySession(B.session);
+    ON_QUEUE(xrDestroySession(B.session));
   B.space = XR_NULL_HANDLE;
   B.session = XR_NULL_HANDLE;
   if (B.dev) {
@@ -10935,8 +10951,9 @@ wgpu::Texture begin_frame(uint32_t width, uint32_t height) noexcept {
     B.phys = h.physicalDevice;
     B.dev = h.device;
     B.queueFamily = h.queueFamilyIndex;
-    B.queueIndex = 1;
-    B.queue = dawn::native::vulkan::GetExtraQueue(webgpu::g_device.Get(), 0);
+    // A spare queue of its own in Dawn's family, or Dawn's shared (device_created).
+    B.queueIndex = B.sharedQueue ? 0 : 1;
+    B.queue = B.sharedQueue ? h.queue : dawn::native::vulkan::GetExtraQueue(webgpu::g_device.Get(), 0);
     g_bindlessOk = webgpu::g_device.HasFeature(wgpu::FeatureName::ChromiumExperimentalSamplingResourceTable);
     gfx::set_xr_bindless(env_flag("AURORA_XR_BINDLESS", true) && g_bindlessOk);
     Log.info("Bindless eye batching: {}", gfx::xr_bindless() ? "on" : "off");
@@ -11032,7 +11049,9 @@ wgpu::Texture begin_frame(uint32_t width, uint32_t height) noexcept {
     gfx::set_xr_early_hooks(&early_eyes, &early_submitted, &early_around_submit);
     const bool earlyEyes = g_multiview && env_flag("AURORA_XR_EARLY_EYES", kEarlyEyesDefault);
     gfx::set_xr_early_eyes(earlyEyes);
-    g_deferEyes = earlyEyes && env_flag("AURORA_XR_DEFER_EYES", kEarlyEyesDefault);
+    // Not with a shared queue: holding Dawn's flush (HoldQueueFlush) is no lock
+    // against the XR thread's use of the queue.
+    g_deferEyes = earlyEyes && !B.sharedQueue && env_flag("AURORA_XR_DEFER_EYES", kEarlyEyesDefault);
     g_phase = Phase::Imported;
     phase = Phase::Imported;
   }
@@ -11117,6 +11136,16 @@ bool prepare_device() noexcept {
     g_phase = Phase::Failed;
     return false;
   }
+#ifndef __ANDROID__
+  // Mesa's Turnip (the Steam Frame) has one graphics queue, but can offer a
+  // second sharing its submissions (the tu_emulate_second_queue driconf
+  // option, read from the environment when the runtime creates Dawn's Vulkan
+  // instance in this process). Then the runtime gets a queue of its own; if
+  // not, it shares Dawn's (device_created). Other drivers ignore it.
+  // AURORA_XR_TU_SECOND_QUEUE=0 leaves it alone.
+  if (env_flag("AURORA_XR_TU_SECOND_QUEUE", true))
+    setenv("tu_emulate_second_queue", "true", 0);
+#endif
   dawn::native::vulkan::ExternalVulkanHooks hooks;
   hooks.createInstance = &hook_create_instance;
   hooks.getPhysicalDevice = &hook_physical_device;
@@ -11125,6 +11154,32 @@ bool prepare_device() noexcept {
   dawn::native::vulkan::SetExternalVulkanHooks(&hooks);
   B.prepared = true;
   return true;
+}
+
+void device_created() noexcept {
+  if (!B.prepared || !webgpu::g_device)
+    return;
+  const auto h = dawn::native::vulkan::GetDeviceVkHandles(webgpu::g_device.Get());
+  // AURORA_XR_SHARED_QUEUE=1 shares the queue even where there's a spare
+  // (testing the shared path on a GPU that has one).
+  if (policy::queue_mode(h.extraQueueCount, env_flag("AURORA_XR_SHARED_QUEUE", false)) == policy::QueueMode::Separate) {
+    Log.info("OpenXR queue: a spare one in Dawn's queue family {}", h.queueFamilyIndex);
+    return;
+  }
+#ifdef AURORA_QUEUE_GUARD_WRAP
+  B.sharedQueue = true;
+  // AURORA_XR_QUEUE_GUARD=0: shared without the lock, which is wrong; only
+  // to check that Vulkan's validation layer sees the races it prevents.
+  const bool guard = env_flag("AURORA_XR_QUEUE_GUARD", true);
+  webgpu::set_queue_shared(guard);
+  Log.info("OpenXR queue: Dawn's queue 0 of family {}, shared with Dawn{}", h.queueFamilyIndex,
+           guard ? "" : " WITHOUT the queue guard (AURORA_XR_QUEUE_GUARD=0, testing only)");
+#else
+  // Without the Dawn entry points wrapped (cmake/aurora_xr.cmake), sharing
+  // can't be made safe: begin_frame finds no queue and presents to the window.
+  Log.warn("OpenXR queue: Dawn's queue family {} has no spare queue, and sharing Dawn's isn't built in",
+           h.queueFamilyIndex);
+#endif
 }
 
 void release_instance() noexcept {
