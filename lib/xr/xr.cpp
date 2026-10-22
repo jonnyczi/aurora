@@ -6,6 +6,7 @@
 #include "../webgpu/gpu.hpp"
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
+#include "../gfx/render_worker.hpp"
 #include "../gfx/xr_replay.hpp"
 #include "../gx/gx.hpp"
 #include "../webgpu/queue_guard.hpp"
@@ -189,6 +190,9 @@ std::mutex g_mutex;
 std::condition_variable g_slotFreeCv; // a slot became Free (XR thread -> render worker)
 std::atomic<Phase> g_phase{Phase::Idle};
 std::atomic<bool> g_stop{false};
+// Set by shutdown before g_stop: begin_frame hands out no more swapchain
+// images, so none is in use when the XR thread destroys them.
+std::atomic<bool> g_stopping{false};
 std::atomic<bool> g_sessionRunning{false};
 std::thread g_thread;
 std::array<Stream, kStreamCount> g_streams;
@@ -642,7 +646,7 @@ Bridge B;
 // Vulkan and OpenXR calls that may use the queue the runtime has (Dawn's,
 // when it is shared: lib/webgpu/queue_guard.hpp). The XR thread's waits for
 // the lock are counted.
-#define ON_QUEUE(x) [&] { const webgpu::QueueGuard queueGuard_{true}; return (x); }()
+#define ON_QUEUE(x) [&] { const webgpu::QueueGuard queueGuard_{true, #x}; return (x); }()
 
 bool env_flag(const char* name, bool def) {
   const char* v = std::getenv(name);
@@ -8496,11 +8500,10 @@ bool render_xr_frame() {
              g_acquireWaitMaxNs[kHud] / 1e6, g_acquireWaitsOver2[kHud], g_acquireWaitMaxNs[kScreen] / 1e6,
              g_acquireWaitsOver2[kScreen], pace_summary());
     if (B.sharedQueue) {
-      int64_t waitMaxNs = 0;
-      uint32_t waitsOver1 = 0;
-      webgpu::queue_guard_waits(waitMaxNs, waitsOver1);
-      Log.info("Shared queue: the XR thread waited for it {:.2f} ms at most, {} times over 1 ms", waitMaxNs / 1e6,
-               waitsOver1);
+      const auto q = webgpu::queue_guard_stats();
+      Log.info("Shared queue: the XR thread waited for it {:.2f} ms at most, {} times over 1 ms; held {:.2f} ms at "
+               "most, by {}",
+               q.waitMaxNs / 1e6, q.waitsOver1ms, q.holdMaxNs / 1e6, q.holdMaxSite);
     }
     g_acquireWaitMaxNs = {};
     g_acquireWaitsOver2 = {};
@@ -10937,7 +10940,7 @@ void screen_size(uint32_t contentWidth, uint32_t contentHeight, uint32_t& width,
 }
 
 wgpu::Texture begin_frame(uint32_t width, uint32_t height) noexcept {
-  if (!wanted() || width == 0 || height == 0)
+  if (!wanted() || width == 0 || height == 0 || g_stopping)
     return {};
   Phase phase = g_phase;
   if (phase == Phase::Idle) {
@@ -11171,7 +11174,7 @@ void device_created() noexcept {
   // AURORA_XR_QUEUE_GUARD=0: shared without the lock, which is wrong; only
   // to check that Vulkan's validation layer sees the races it prevents.
   const bool guard = env_flag("AURORA_XR_QUEUE_GUARD", true);
-  webgpu::set_queue_shared(guard);
+  webgpu::set_queue_shared(guard, webgpu::g_device.Get());
   Log.info("OpenXR queue: Dawn's queue 0 of family {}, shared with Dawn{}", h.queueFamilyIndex,
            guard ? "" : " WITHOUT the queue guard (AURORA_XR_QUEUE_GUARD=0, testing only)");
 #else
@@ -11191,6 +11194,11 @@ void release_instance() noexcept {
 }
 
 void shutdown() noexcept {
+  // A frame the render worker took after the caller last synchronized it
+  // could still be drawing into a swapchain image: no more images, then the
+  // worker drained, then the XR thread (which destroys them) stopped.
+  g_stopping = true;
+  gfx::render_worker::synchronize();
   g_stop = true;
   if (g_thread.joinable() && g_thread.get_id() != std::this_thread::get_id())
     g_thread.join();
