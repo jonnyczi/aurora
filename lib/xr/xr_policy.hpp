@@ -61,9 +61,12 @@ float display_rate(float reportedHz, int64_t periodNs) noexcept;
 int per_game_frame(float rateHz) noexcept;
 
 // The refresh rate to request from those offered: wantedHz (AURORA_XR_REFRESH,
-// 0: none) if offered, else 60, else 120. 0: request nothing, which is also
-// the answer when the runtime offers just one rate (the Steam Frame lists only
-// the one the player chose in its settings).
+// 0: none) if offered, else 60, else 120. 0: request nothing. A runtime that
+// lists just one rate (SteamVR on the Steam Frame lists the one it runs at,
+// its auto-adjust moving it among 72, 90, 108, 120 and 144 Hz) is asked for
+// wantedHz, else 120, even when already there (to hold it): at the others the
+// game's 60 frames a second land unevenly on the display frames, and the 3D
+// view shook with every head movement. Steady at 120 it didn't.
 float pick_refresh(const std::vector<float>& rates, float wantedHz) noexcept;
 
 // ---------------------------------------------------------------- the queue

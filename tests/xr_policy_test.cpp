@@ -97,9 +97,14 @@ TEST(XrPolicyPacing, RefreshPick) {
   EXPECT_FLOAT_EQ(pick_refresh({60.f, 72.f, 90.f, 120.f}, 0.f), 60.f);
   EXPECT_FLOAT_EQ(pick_refresh({72.f, 90.f, 120.f}, 90.f), 90.f);
   EXPECT_FLOAT_EQ(pick_refresh({72.f, 90.f}, 0.f), 0.f);
-  // The Steam Frame lists only the rate chosen in its settings: ask nothing.
-  EXPECT_FLOAT_EQ(pick_refresh({90.f}, 0.f), 0.f);
-  EXPECT_FLOAT_EQ(pick_refresh({120.f}, 120.f), 0.f);
+  // The Steam Frame lists only the rate it runs at: asked for 120 (held when
+  // already there), or for AURORA_XR_REFRESH.
+  EXPECT_FLOAT_EQ(pick_refresh({72.f}, 0.f), 120.f);
+  EXPECT_FLOAT_EQ(pick_refresh({90.f}, 0.f), 120.f);
+  EXPECT_FLOAT_EQ(pick_refresh({144.f}, 0.f), 120.f);
+  EXPECT_FLOAT_EQ(pick_refresh({120.f}, 0.f), 120.f);
+  EXPECT_FLOAT_EQ(pick_refresh({120.f}, 120.f), 120.f);
+  EXPECT_FLOAT_EQ(pick_refresh({72.f}, 90.f), 90.f);
   EXPECT_FLOAT_EQ(pick_refresh({}, 0.f), 0.f);
 }
 

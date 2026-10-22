@@ -2865,6 +2865,18 @@ void request_performance_levels() {
   request("AURORA_XR_PERF_GPU", "off", XR_PERF_SETTINGS_DOMAIN_GPU_EXT, "GPU");
 }
 
+// The rate wanted (0: none) and whether the runtime last granted it. SteamVR
+// on the Steam Frame lists only the rate it runs at and grants only that one,
+// while its auto-adjust moves it among 72, 90, 108, 120 and 144 Hz, with no
+// change event: the rate is asked for again whenever the display's changes
+// (update_pacing), up to kMaxRefreshAsks times, so it is taken when it comes
+// by, until the runtime refuses a rate it offers (SteamVR 2.18 refuses them
+// all: there only the headset's settings hold 120 Hz).
+float g_wantedHz = 0.f;
+bool g_refreshGranted = false;
+int g_refreshAsks = 0;
+constexpr int kMaxRefreshAsks = 60;
+
 void request_refresh_rate() {
   if (!B.enumerateRefreshRates || !B.requestRefreshRate)
     return;
@@ -2877,13 +2889,46 @@ void request_refresh_rate() {
   std::string list;
   for (float r : rates)
     list += fmt::format("{}{:.0f}", list.empty() ? "" : ", ", r);
-  // AURORA_XR_REFRESH if offered, else 60, else 120; nothing where the
-  // runtime lists a single rate (the Steam Frame: the one the player chose).
+  // AURORA_XR_REFRESH if offered, else 60, else 120; a runtime listing a
+  // single rate (the Steam Frame: the one it runs at) is asked for 120.
   const float pick = policy::pick_refresh(rates, env_float("AURORA_XR_REFRESH", 0.f));
-  if (pick > 0.f && XR_SUCCEEDED(B.requestRefreshRate(B.session, pick)))
-    Log.info("Display refresh rates offered: {}; requested {:.0f} Hz", list, pick);
-  else
+  if (pick <= 0.f) {
     Log.info("Display refresh rates offered: {}; keeping the {}", list, rates.size() == 1 ? "headset's" : "default");
+    return;
+  }
+  ++g_refreshAsks;
+  g_wantedHz = pick;
+  const XrResult r = B.requestRefreshRate(B.session, pick);
+  g_refreshGranted = XR_SUCCEEDED(r);
+  const bool listed =
+      std::any_of(rates.begin(), rates.end(), [pick](float rate) { return std::abs(rate - pick) < 0.5f; });
+  if (g_refreshGranted) {
+    Log.info("Display refresh rates offered: {}; requested {:.0f} Hz", list, pick);
+  } else if (listed) {
+    // Refused although offered (SteamVR 2.18 on the Steam Frame): the runtime
+    // takes no requests; its own settings decide.
+    g_wantedHz = 0.f;
+    Log.info(
+        "Display refresh rates offered: {}; {:.0f} Hz refused although offered (XrResult {}): the "
+        "runtime picks the rate itself, so set the headset to 120 Hz",
+        list, pick, static_cast<int>(r));
+  } else {
+    Log.info("Display refresh rates offered: {}; {:.0f} Hz refused (XrResult {}), asked again when the rate changes",
+             list, pick, static_cast<int>(r));
+  }
+}
+
+// The display's rate changed (update_pacing): the wanted one asked for again
+// unless it was granted and is the rate shown.
+void refresh_rate_moved(float displayHz) {
+  if (g_wantedHz <= 0.f || (g_refreshGranted && std::abs(displayHz - g_wantedHz) < 0.5f))
+    return;
+  if (g_refreshAsks >= kMaxRefreshAsks) {
+    if (g_refreshAsks++ == kMaxRefreshAsks)
+      Log.warn("Display refresh rate: asked for {:.0f} Hz {} times; no longer asking", g_wantedHz, kMaxRefreshAsks);
+    return;
+  }
+  request_refresh_rate();
 }
 
 // Recompute how many display frames each game frame gets from the current
@@ -2922,6 +2967,13 @@ void update_pacing() {
                  ? fmt::format("game paced to every {} display frame(s)", g_displayPerGameFrame.load())
                  : std::string{"not a multiple of 60 Hz, game keeps its own timer (a headset "
                                "set to 120 Hz shows each game frame for two display frames)"});
+  // SteamVR's auto-adjust moves the display's rate with no event.
+  static float lastDisplayHz = 0.f;
+  const float displayHz = reported > 0.f ? reported : policy::display_rate(0.f, g_displayPeriodNs);
+  if (std::abs(displayHz - lastDisplayHz) > 0.5f) {
+    lastDisplayHz = displayHz;
+    refresh_rate_moved(displayHz);
+  }
 }
 
 // Publish where the eyes will be when the render worker's next 3D frame is
@@ -8911,6 +8963,8 @@ bool poll_events() {
     } else if (B.anchors && spot_event(ev)) {
       // the stage spot's anchor
     } else if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
+      const auto& rc = reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB&>(ev);
+      Log.info("Display refresh rate changed: {:.0f} -> {:.0f} Hz", rc.fromDisplayRefreshRate, rc.toDisplayRefreshRate);
       update_pacing();
     } else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
       update_hand_profiles();

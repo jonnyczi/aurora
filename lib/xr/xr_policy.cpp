@@ -54,8 +54,10 @@ int per_game_frame(float rateHz) noexcept {
 }
 
 float pick_refresh(const std::vector<float>& rates, float wantedHz) noexcept {
-  if (rates.size() < 2)
+  if (rates.empty())
     return 0.f;
+  if (rates.size() == 1)
+    return wantedHz > 0.f ? wantedHz : 120.f;
   const auto offered = [&](float want) {
     return std::any_of(rates.begin(), rates.end(), [&](float r) { return std::abs(r - want) < 0.5f; });
   };
