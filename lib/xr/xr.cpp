@@ -6492,6 +6492,20 @@ void capture_start() {
   g_capture.lightAt = {};
 }
 
+// ROOM chosen again: the capture so far kept (ambient capture goes on from
+// it), so ROOM and another source compare back to back; a capture only
+// when there is none yet (RECAPTURE starts over).
+void capture_resume() {
+  {
+    std::lock_guard lock{g_capture.mutex};
+    if (g_capture.made || g_capture.frames > 0) {
+      g_capture.room = true;
+      return;
+    }
+  }
+  capture_start();
+}
+
 // Another source chosen: no ambient capture.
 void capture_stop() {
   std::lock_guard lock{g_capture.mutex};
@@ -6605,8 +6619,8 @@ std::string capture_brightest() {
   return out;
 }
 
-// The Light page's ROOM segment while a capture runs: the seconds left
-// (-1: none running).
+// The Light page's ROOM segment and RECAPTURE while a capture runs: the
+// seconds left (-1: none running).
 int capture_seconds_left() {
   std::lock_guard lock{g_capture.mutex};
   if (!g_capture.requested)
@@ -6921,7 +6935,7 @@ Rgba linear_rgba(float r, float g, float b) {
           static_cast<uint8_t>(std::lround(srgb_encode(b) * 255.f)), 255};
 }
 
-constexpr int kPanelW = 768, kPanelH = 480;
+constexpr int kPanelW = 768, kPanelH = 520;
 constexpr int kTrackX0 = 170, kTrackX1 = 590, kTrackH = 30;
 constexpr int kRowY0 = 76, kRowStep = 86;
 constexpr int kResetX0 = 604, kResetX1 = 750, kResetY0 = 10, kResetY1 = 52;
@@ -6974,9 +6988,12 @@ constexpr std::array<const char*, 4> kViewNames{"OFF", "LIT", "CLASS", "NORMALS"
 
 // What's under a laser: a tint slider (kHue..kSat), an Audio row (kAudio +
 // row), a tab (kTab + page), Reset, a Stage channel (kMixChan + channel),
-// its level, its graph or its Q, a Light row (kLightRow + row), or -1.
+// its level, its graph or its Q, Recapture, a Light row (kLightRow + row),
+// or -1.
 constexpr int kAudio = 10, kTab = 20, kReset = 30, kMixChan = 40, kMixLevel = 50, kMixGraph = 51, kMixQ = 52,
-              kLightRow = 60;
+              kRecapture = 55, kLightRow = 60;
+// Recapture, under the Light page's rows: a new room capture (ROOM chosen).
+constexpr int kRecaptureY = kLightRowY0 + kRlRows * kLightRowStep;
 
 struct DevPanel {
   bool shown = false;
@@ -7424,6 +7441,12 @@ void draw_light(Canvas& c) {
       c.text(x0 + (w - tw) / 2, y + 4, 3, label.c_str(), on ? text : dim);
     }
   }
+  const int left = capture_seconds_left();
+  const std::string label = left >= 0 ? fmt::format("CAPTURING {}S", left) : "RECAPTURE";
+  c.fill(kTrackX0 + 2, kRecaptureY - 4, kChoiceX1 - 2, kRecaptureY + kTrackH + 4,
+         P.hover == kRecapture || left >= 0 ? Rgba{70, 110, 150, 255} : Rgba{52, 56, 68, 255});
+  const int tw = static_cast<int>(label.size()) * 18 - 3;
+  c.text(kTrackX0 + (kChoiceX1 - kTrackX0 - tw) / 2, kRecaptureY + 4, 3, label.c_str(), text);
 }
 
 void draw_panel(Canvas& c) {
@@ -7511,6 +7534,8 @@ int panel_target(float px, float py) {
       if ((row == kRlSource || on) && px >= kTrackX0 - 24 && px < kChoiceX1 && py >= y - 10 && py < y + kTrackH + 10)
         return kLightRow + row;
     }
+    if (px >= kTrackX0 && px < kChoiceX1 && py >= kRecaptureY - 10 && py < kRecaptureY + kTrackH + 10)
+      return kRecapture;
     return -1;
   }
   for (int row = 0; row < kAudioRows; ++row) {
@@ -7542,9 +7567,23 @@ void light_choose(int row, float px) {
     r = v;
   }
   if (row == kRlSource && i == kRoomSourceCaptured)
-    capture_start(); // again each time it's chosen
+    capture_resume();
   else if (row == kRlSource)
     capture_stop();
+  room_light_apply(r);
+  P.dirty = true;
+  light_log();
+}
+
+// Recapture: ROOM chosen, its capture started over.
+void light_recapture() {
+  RoomLight r;
+  {
+    std::lock_guard lock{g_room.mutex};
+    g_room.value.source = kRoomSourceCaptured;
+    r = g_room.value;
+  }
+  capture_start();
   room_light_apply(r);
   P.dirty = true;
   light_log();
@@ -7768,6 +7807,8 @@ void update_dev_panel(bool show, bool tintUsable) {
       P.dirty = true;
     } else if (panel_pressed(hand) && target == kAudio + kSpatial) {
       audio_choose(target - kAudio, px);
+    } else if (panel_pressed(hand) && target == kRecapture) {
+      light_recapture();
     } else if (panel_pressed(hand) && target >= kLightRow && target < kLightRow + kRlRows && !light_is_slider(target)) {
       light_choose(target - kLightRow, px);
     } else if (panel_pressed(hand) && target >= kMixChan && target < kMixChan + AURORA_XR_MIX_CHANNELS) {
