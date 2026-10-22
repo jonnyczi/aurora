@@ -1143,6 +1143,47 @@ VkImageCreateInfo swapchain_image_info(const Stream& st) {
   return ici;
 }
 
+// Every swapchain is counted. Runtimes cap them (the Steam Frame's SteamVR
+// at 16 a session), so an optional one (a picture that can come later: the
+// shadow, placing cards and clips, the dev panel, SpaceWarp's zero vectors)
+// is created only within the budget: AURORA_XR_MAX_SWAPCHAINS, or how many
+// were alive when the runtime first refused one (XR_ERROR_LIMIT_REACHED).
+// The screen, the 3D view, the HUD and the lasers are always tried.
+int g_liveSwapchains = 0, g_peakSwapchains = 0;
+int g_swapchainBudget = -1; // -1: not read yet; 0: none known
+bool g_swapchainLimited = false; // the last refusal was the budget's (worth trying again later)
+
+XrResult new_swapchain(const XrSwapchainCreateInfo& ci, XrSwapchain& out, bool optional) {
+  if (g_swapchainBudget < 0)
+    g_swapchainBudget = std::max(0, static_cast<int>(env_float("AURORA_XR_MAX_SWAPCHAINS", 0.f)));
+  g_swapchainLimited = false;
+  if (!policy::swapchain_admit(g_liveSwapchains, g_swapchainBudget, !optional)) {
+    g_swapchainLimited = true;
+    return XR_ERROR_LIMIT_REACHED;
+  }
+  const XrResult r = ON_QUEUE(xrCreateSwapchain(B.session, &ci, &out));
+  if (r == XR_ERROR_LIMIT_REACHED) {
+    g_swapchainLimited = true;
+    if (g_swapchainBudget == 0 || g_swapchainBudget > g_liveSwapchains) {
+      g_swapchainBudget = g_liveSwapchains;
+      Log.warn("The runtime allows {} swapchains: optional pictures only as they fit", g_swapchainBudget);
+    }
+  } else if (XR_SUCCEEDED(r) && ++g_liveSwapchains > g_peakSwapchains) {
+    g_peakSwapchains = g_liveSwapchains;
+    Log.info("Swapchains alive: {}, the most yet{}", g_peakSwapchains,
+             g_swapchainBudget > 0 ? fmt::format(" (budget {})", g_swapchainBudget) : std::string{});
+  }
+  return r;
+}
+
+void free_swapchain(XrSwapchain& sc) {
+  if (sc == XR_NULL_HANDLE)
+    return;
+  ON_QUEUE(xrDestroySwapchain(sc));
+  --g_liveSwapchains;
+  sc = XR_NULL_HANDLE;
+}
+
 bool create_swapchain(Stream& st) {
   if (st.width == 0)
     return true; // not in use (the SpaceWarp streams without AURORA_XR_APPSW)
@@ -1160,7 +1201,7 @@ bool create_swapchain(Stream& st) {
   ci.faceCount = 1;
   ci.arraySize = st.layers;
   ci.mipCount = 1;
-  XR_TRY(ON_QUEUE(xrCreateSwapchain(B.session, &ci, &st.swapchain)));
+  XR_TRY(new_swapchain(ci, st.swapchain, false));
   uint32_t n = 0;
   XR_TRY(xrEnumerateSwapchainImages(st.swapchain, 0, &n, nullptr));
   std::vector<XrSwapchainImageVulkan2KHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
@@ -3679,9 +3720,10 @@ void free_finished_uploads(bool all = false) {
 
 // Fill a one-image swapchain once; the runtime keeps showing it. Without
 // pixels (rgba empty) it is cleared to zero instead, in `format` with
-// `layers` layers (else the swapchains' own format, one layer).
+// `layers` layers (else the swapchains' own format, one layer). optional:
+// within the swapchain budget only (new_swapchain).
 bool create_static_swapchain(XrSwapchain& out, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgba,
-                             int64_t format = 0, uint32_t layers = 1) {
+                             int64_t format = 0, uint32_t layers = 1, bool optional = false) {
   XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
   ci.createFlags = XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT;
   // Color attachment: released in that layout, as OpenXR expects of color images.
@@ -3694,9 +3736,11 @@ bool create_static_swapchain(XrSwapchain& out, uint32_t w, uint32_t h, const std
   ci.faceCount = 1;
   ci.arraySize = layers;
   ci.mipCount = 1;
-  if (XR_FAILED(ON_QUEUE(xrCreateSwapchain(B.session, &ci, &out)))) {
+  if (XR_FAILED(new_swapchain(ci, out, optional))) {
+    if (g_swapchainLimited)
+      return false; // no room for it now
     ci.createFlags = 0;
-    XR_TRY(ON_QUEUE(xrCreateSwapchain(B.session, &ci, &out)));
+    XR_TRY(new_swapchain(ci, out, optional));
   }
   uint32_t n = 0;
   XR_TRY(xrEnumerateSwapchainImages(out, 0, &n, nullptr));
@@ -5627,7 +5671,7 @@ bool create_shadow_texture() {
       const float r = std::pow(std::pow(std::abs(u), 4.f) + std::pow(std::abs(v), 4.f), 0.25f);
       px[(y * kShadowSize + x) * 4 + 3] = static_cast<uint8_t>(std::lround((1.f - smoothstep(0.5f, 1.5f, r)) * 255.f));
     }
-  return create_static_swapchain(B.shadowSwapchain, kShadowSize, kShadowSize, px);
+  return create_static_swapchain(B.shadowSwapchain, kShadowSize, kShadowSize, px, 0, 1, true);
 }
 
 // The rotation b, then a.
@@ -6094,7 +6138,17 @@ bool upload_placing_image(PlacingImage& img) {
       px[i + c] = encode[static_cast<int>(std::lround(decode[img.rgba[i + c]] * a * kSteps))];
     px[i + 3] = img.rgba[i + 3];
   }
-  return create_static_swapchain(img.swapchain, img.width, img.height, px);
+  return create_static_swapchain(img.swapchain, img.width, img.height, px, 0, 1, true);
+}
+
+// The placing pictures' swapchains (their pixels stay, to make them again):
+// at teardown, and after a hold where the runtime caps swapchains.
+void free_placing_swapchains() {
+  std::lock_guard lock{g_placingMutex};
+  for (auto& clip : g_placingClips)
+    free_swapchain(clip.atlas.swapchain);
+  for (auto& img : g_placingImages)
+    free_swapchain(img.swapchain);
 }
 
 constexpr size_t kMaxPlacingLayers = 2 + 3; // the cards, the legend, the clips
@@ -6187,6 +6241,15 @@ void build_placing_layers(PlacingLayers& out, int mode) {
     if (img.width == 0)
       return false;
     if (!img.swapchain && !upload_placing_image(img)) {
+      // Over the runtime's swapchain budget: tried again on later frames
+      // (others may have gone by then). Any other failure is for good.
+      if (g_swapchainLimited) {
+        static bool warned = false;
+        if (!warned)
+          Log.warn("No swapchain to spare for placing picture {} yet", what);
+        warned = true;
+        return false;
+      }
       Log.warn("Placing picture {} unavailable", what);
       img.width = 0;
       return false;
@@ -8015,7 +8078,7 @@ void update_dev_panel(bool show, bool tintUsable) {
 bool build_dev_panel_layer(XrCompositionLayerQuad& q) {
   const auto now = std::chrono::steady_clock::now();
   while (!P.retired.empty() && now - P.retired.front().second > std::chrono::milliseconds(500)) {
-    ON_QUEUE(xrDestroySwapchain(P.retired.front().first));
+    free_swapchain(P.retired.front().first);
     P.retired.pop_front();
   }
   if (!P.shown)
@@ -8053,10 +8116,10 @@ bool build_dev_panel_layer(XrCompositionLayerQuad& q) {
 
 void destroy_dev_panel() {
   for (auto& r : P.retired)
-    ON_QUEUE(xrDestroySwapchain(r.first));
+    free_swapchain(r.first);
   P.retired.clear();
   if (P.image.swapchain)
-    ON_QUEUE(xrDestroySwapchain(P.image.swapchain));
+    free_swapchain(P.image.swapchain);
   P.image.swapchain = XR_NULL_HANDLE;
   P.shown = false;
   P.active = P.activeHand = -1;
@@ -8346,6 +8409,19 @@ bool render_xr_frame() {
   }
   // Paused, or held before it starts for placing the stage.
   const int placing = g_placing.load();
+  // Where the runtime caps swapchains (a budget is known), the placing
+  // pictures go half a second after a hold ends, making room for others;
+  // the next hold makes them again.
+  {
+    static std::chrono::steady_clock::time_point heldUntil{};
+    if (placing > 0) {
+      heldUntil = now;
+    } else if (g_swapchainBudget > 0 && heldUntil.time_since_epoch().count() != 0 &&
+               now - heldUntil > std::chrono::milliseconds(500)) {
+      heldUntil = {};
+      free_placing_swapchains();
+    }
+  }
   const bool held = g_fightPaused || placing > 0;
   {
     // Each 3D image is due for g_displayPerGameFrame display frames under
@@ -8809,7 +8885,7 @@ bool setup() {
     Log.info("3D images staged: {} of our own per stream, copied into the swapchains", g_streams[kStereo].ring.size());
   if (const auto& mv = g_streams[kMotion]; B.appSw && mv.width > 0 &&
                                            !create_static_swapchain(B.zeroMotionSwapchain, mv.width, mv.height, {},
-                                                                    mv.swapFormat, mv.layers))
+                                                                    mv.swapFormat, mv.layers, true))
     Log.warn("SpaceWarp: no zero motion vectors; images submitted again go without SpaceWarp info");
   // The room by alpha blending: a clear image for the projection layer every
   // frame starts with (create_static_swapchain clears it to zero).
@@ -8878,23 +8954,11 @@ void teardown() {
   for (XrSwapchain* sc : {&B.beamSwapchain, &B.dotSwapchain, &B.barSwapchain, &B.backSwapchain,
                           &B.zeroMotionSwapchain, &B.shadowSwapchain, &B.roomSwapchain}) {
     if (*sc)
-      ON_QUEUE(xrDestroySwapchain(*sc));
+      free_swapchain(*sc);
     *sc = XR_NULL_HANDLE;
   }
   destroy_dev_panel();
-  {
-    std::lock_guard lock{g_placingMutex};
-    for (auto& clip : g_placingClips) {
-      if (clip.atlas.swapchain)
-        ON_QUEUE(xrDestroySwapchain(clip.atlas.swapchain));
-      clip.atlas.swapchain = XR_NULL_HANDLE;
-    }
-    for (auto& img : g_placingImages) {
-      if (img.swapchain)
-        ON_QUEUE(xrDestroySwapchain(img.swapchain));
-      img.swapchain = XR_NULL_HANDLE;
-    }
-  }
+  free_placing_swapchains();
   if (B.actionSet)
     xrDestroyActionSet(B.actionSet); // destroys its actions too
   B.actionSet = XR_NULL_HANDLE;
@@ -8912,7 +8976,7 @@ void teardown() {
   // stopped (Phase::Failed or g_stop) before this runs.
   for (auto& st : g_streams) {
     if (st.swapchain)
-      ON_QUEUE(xrDestroySwapchain(st.swapchain));
+      free_swapchain(st.swapchain);
     st.swapchain = XR_NULL_HANDLE;
   }
   if (B.floorSpace)
