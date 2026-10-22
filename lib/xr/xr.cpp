@@ -2959,6 +2959,10 @@ int64_t g_loopPeriodNs = 0;
 // xrWaitFrame's predictedDisplayPeriod without SpaceWarp: the display's
 // period, whatever the runtime reports (0: no frame yet).
 int64_t g_displayPeriodNs = 0;
+// Their changes count once they last (policy::period_changed): SteamVR
+// reports a held frame's period for one frame now and then.
+constexpr int kPeriodSettleFrames = 12;
+policy::PeriodWatch g_loopWatch, g_displayWatch;
 
 void update_pacing() {
   float reported = 0.f;
@@ -8375,7 +8379,7 @@ bool render_xr_frame() {
     const int64_t period = fs.predictedDisplayPeriod;
     const int64_t current = g_loopPeriodNs > 0 ? g_loopPeriodNs
                                                : static_cast<int64_t>(1e9 / std::max(g_displayHz.load(), 1.f));
-    if (std::llabs(period - current) * 10 > current) {
+    if (policy::period_changed(g_loopWatch, period, current, kPeriodSettleFrames)) {
       g_loopPeriodNs = period;
       update_pacing();
       // Latency counts loop frames: keep its time (rounded up, within the
@@ -8391,8 +8395,8 @@ bool render_xr_frame() {
       Log.info("XR loop period {:.2f} ms: SpaceWarp {}", period / 1e6,
                g_displayHz.load() < 100.f ? "active" : "idle");
     }
-  } else if (fs.predictedDisplayPeriod > 0 &&
-             std::llabs(fs.predictedDisplayPeriod - g_displayPeriodNs) * 10 > std::max<int64_t>(g_displayPeriodNs, 1)) {
+  } else if (policy::period_changed(g_displayWatch, fs.predictedDisplayPeriod, g_displayPeriodNs,
+                                    kPeriodSettleFrames)) {
     // The display's period: what pacing goes by where the runtime reports no
     // rate, or one it doesn't run at.
     g_displayPeriodNs = fs.predictedDisplayPeriod;
