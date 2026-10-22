@@ -477,6 +477,17 @@ struct Bridge {
   XrPassthroughFB passthrough = XR_NULL_HANDLE;
   XrPassthroughLayerFB passthroughLayer = XR_NULL_HANDLE;
   bool running = false;
+  // How the room shows behind the game (create_session): XR_FB_passthrough's
+  // layer (the Quest), or the frame blended over it by its alpha where the
+  // system offers ALPHA_BLEND and no such layer (the Steam Frame on the
+  // headset), or not at all. Blending, every frame starts with a clear
+  // projection layer (roomSwapchain, at the views of frameViews): the Steam
+  // Frame shows the room only behind a projection layer, and menus have none.
+  policy::Room room = policy::Room::None;
+  bool alphaBlendOffered = false;
+  XrSwapchain roomSwapchain = XR_NULL_HANDLE;
+  std::array<XrView, 2> frameViews{};
+  bool frameViewsValid = false;
 
   // Dawn's device (borrowed: Dawn owns it), set by begin_frame before the XR
   // thread starts. `queue` is the spare queue Dawn created for us (index
@@ -878,6 +889,31 @@ bool create_instance() {
   XrSystemGetInfo si{XR_TYPE_SYSTEM_GET_INFO};
   si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
   XR_TRY(xrGetSystem(B.instance, &si, &B.systemId));
+  {
+    // ALPHA_BLEND: the room behind the frame where XR_FB_passthrough isn't
+    // offered (the Steam Frame on the headset; SteamVR streaming to it offers
+    // only OPAQUE).
+    uint32_t nb = 0;
+    std::vector<XrEnvironmentBlendMode> modes;
+    if (XR_SUCCEEDED(xrEnumerateEnvironmentBlendModes(B.instance, B.systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                                      0, &nb, nullptr)) &&
+        nb > 0) {
+      modes.resize(nb);
+      if (XR_FAILED(xrEnumerateEnvironmentBlendModes(B.instance, B.systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                                     nb, &nb, modes.data())))
+        modes.clear();
+    }
+    std::string list;
+    for (const auto m : modes) {
+      B.alphaBlendOffered |= m == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+      list += fmt::format("{}{}", list.empty() ? "" : ", ",
+                          m == XR_ENVIRONMENT_BLEND_MODE_OPAQUE        ? "opaque"
+                          : m == XR_ENVIRONMENT_BLEND_MODE_ADDITIVE    ? "additive"
+                          : m == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND ? "alpha blend"
+                                                                       : "other");
+    }
+    Log.info("Environment blend modes: {}", list.empty() ? std::string{"none listed"} : list);
+  }
   {
     XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES};
     XrSystemEnvironmentRaycastPropertiesMETA raycast{XR_TYPE_SYSTEM_ENVIRONMENT_RAYCAST_PROPERTIES_META};
@@ -1357,7 +1393,12 @@ bool create_session() {
 #endif
   (void)offered;
 
-  if (B.createPassthrough && B.createPassthroughLayer && env_flag("AURORA_XR_PASSTHROUGH", true)) {
+  // AURORA_XR_ROOM=auto|fb|blend|none picks how the room shows (blend: by
+  // alpha even with XR_FB_passthrough offered); AURORA_XR_PASSTHROUGH=0
+  // shows none.
+  const bool roomOn = env_flag("AURORA_XR_PASSTHROUGH", true);
+  const auto roomPref = roomOn ? policy::parse_room_pref(std::getenv("AURORA_XR_ROOM")) : policy::RoomPref::None;
+  if (B.createPassthrough && B.createPassthroughLayer && policy::try_fb_layer(roomPref)) {
     XrPassthroughCreateInfoFB pci{XR_TYPE_PASSTHROUGH_CREATE_INFO_FB};
     pci.flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB;
     if (XR_SUCCEEDED(B.createPassthrough(B.session, &pci, &B.passthrough))) {
@@ -1372,11 +1413,15 @@ bool create_session() {
       B.passthrough = XR_NULL_HANDLE;
     }
   }
+  // The room's clear projection layer is made in setup (room_swapchain).
+  B.room = policy::room_mode(B.passthroughLayer != XR_NULL_HANDLE, B.alphaBlendOffered, roomPref);
   Log.info("Swapchains: screen {}x{}, 3D {}x{} (two {}x{} eyes, format {}), HUD {}x{} (format {}), passthrough {}",
            g_streams[kScreen].width, g_streams[kScreen].height, g_streams[kStereo].width, g_streams[kStereo].height,
            g_multiview ? g_streams[kStereo].width : g_streams[kStereo].width / 2, g_streams[kStereo].height,
-           g_streams[kStereo].swapFormat,
-           g_streams[kHud].width, g_streams[kHud].height, B.swapFormat, B.passthroughLayer ? "on" : "off");
+           g_streams[kStereo].swapFormat, g_streams[kHud].width, g_streams[kHud].height, B.swapFormat,
+           B.room == policy::Room::Fb      ? "on (XR_FB_passthrough layer)"
+           : B.room == policy::Room::Alpha ? "on (alpha blend)"
+                                           : "off");
   return true;
 }
 
@@ -2808,10 +2853,14 @@ void publish_views(XrTime displayTime) {
   XrViewState vs{XR_TYPE_VIEW_STATE};
   std::array<XrView, 2> views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
   uint32_t n = 0;
+  B.frameViewsValid = false;
   if (XR_FAILED(xrLocateViews(B.session, &vli, &vs, 2, &n, views.data())) || n != 2)
     return;
   const bool valid = (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 &&
                      (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+  // This display frame's views, for the room's projection layer (XR thread).
+  B.frameViews = views;
+  B.frameViewsValid = (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
   std::array<XrView, 2> renderViews = views;
   const bool lead = g_tweak.lead;
   const int latency = g_present.latency;
@@ -8359,10 +8408,29 @@ bool render_xr_frame() {
   std::array<const XrCompositionLayerBaseHeader*, 5 + kMaxPlacingLayers + kMaxPointerLayers> layers{};
   uint32_t layerCount = 0;
   XrCompositionLayerPassthroughFB ptLayer{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
+  std::array<XrCompositionLayerProjectionView, 2> roomViews{};
+  XrCompositionLayerProjection roomLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
   sync_passthrough();
   sync_boundary();
-  const bool roomShown = B.passthroughLayer && B.passthroughRunning && g_passthroughWanted;
-  if (roomShown) {
+  // Blending, the room shows wherever the frame's alpha lets it, behind a
+  // clear projection layer at the bottom (the Steam Frame shows it only
+  // behind one, and a menu frame has none of its own).
+  const bool roomBlended = B.room == policy::Room::Alpha && g_passthroughWanted && B.frameViewsValid;
+  const bool roomShown = (B.passthroughLayer && B.passthroughRunning && g_passthroughWanted) || roomBlended;
+  if (roomBlended) {
+    for (int i = 0; i < 2; ++i) {
+      roomViews[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+      roomViews[i].pose = B.frameViews[i].pose;
+      roomViews[i].fov = B.frameViews[i].fov;
+      roomViews[i].subImage.swapchain = B.roomSwapchain;
+      roomViews[i].subImage.imageRect = {{0, 0}, {16, 16}};
+    }
+    roomLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    roomLayer.space = B.space;
+    roomLayer.viewCount = 2;
+    roomLayer.views = roomViews.data();
+    layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&roomLayer);
+  } else if (roomShown) {
     ptLayer.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     ptLayer.layerHandle = B.passthroughLayer;
     layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ptLayer);
@@ -8530,7 +8598,8 @@ bool render_xr_frame() {
   layerCount = sanitize_layers(layers.data(), layerCount);
   XrFrameEndInfo fei{XR_TYPE_FRAME_END_INFO};
   fei.displayTime = fs.predictedDisplayTime;
-  fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+  // Opaque on the Quest, its room a layer of its own.
+  fei.environmentBlendMode = roomBlended ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
   fei.layerCount = layerCount;
   fei.layers = layers.data();
   section(7);
@@ -8742,6 +8811,13 @@ bool setup() {
                                            !create_static_swapchain(B.zeroMotionSwapchain, mv.width, mv.height, {},
                                                                     mv.swapFormat, mv.layers))
     Log.warn("SpaceWarp: no zero motion vectors; images submitted again go without SpaceWarp info");
+  // The room by alpha blending: a clear image for the projection layer every
+  // frame starts with (create_static_swapchain clears it to zero).
+  if (B.room == policy::Room::Alpha && !create_static_swapchain(B.roomSwapchain, 16, 16, {})) {
+    Log.warn("No projection layer for the room; the room stays hidden");
+    B.room = policy::Room::None;
+  }
+  g_roomAvailable = B.room != policy::Room::None ? 1 : 0;
   if (!create_input())
     Log.warn("Controller input unavailable");
   if (!create_pointer_textures())
@@ -8800,7 +8876,7 @@ void teardown() {
     ht = XR_NULL_HANDLE;
   }
   for (XrSwapchain* sc : {&B.beamSwapchain, &B.dotSwapchain, &B.barSwapchain, &B.backSwapchain,
-                          &B.zeroMotionSwapchain, &B.shadowSwapchain}) {
+                          &B.zeroMotionSwapchain, &B.shadowSwapchain, &B.roomSwapchain}) {
     if (*sc)
       ON_QUEUE(xrDestroySwapchain(*sc));
     *sc = XR_NULL_HANDLE;
