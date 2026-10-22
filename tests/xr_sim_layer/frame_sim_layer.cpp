@@ -258,8 +258,8 @@ XRAPI_ATTR XrResult XRAPI_CALL sim_DestroySwapchain(XrSwapchain swapchain) {
   return S.destroySwapchain(swapchain);
 }
 
-XRAPI_ATTR XrResult XRAPI_CALL sim_SuggestInteractionProfileBindings(
-    XrInstance instance, const XrInteractionProfileSuggestedBinding* suggested) {
+XRAPI_ATTR XrResult XRAPI_CALL
+sim_SuggestInteractionProfileBindings(XrInstance instance, const XrInteractionProfileSuggestedBinding* suggested) {
   if (!S.frame || path_string(suggested->interactionProfile) != kFrameProfile)
     return S.suggest(instance, suggested);
   // Like a runtime: one path it doesn't know rejects the whole suggestion.
@@ -392,8 +392,8 @@ XRAPI_ATTR XrResult XRAPI_CALL sim_GetDisplayRefreshRateFB(XrSession session, fl
   return XR_SUCCESS;
 }
 
-XRAPI_ATTR XrResult XRAPI_CALL sim_EnumerateDisplayRefreshRatesFB(XrSession session, uint32_t capacity,
-                                                                  uint32_t* count, float* rates) {
+XRAPI_ATTR XrResult XRAPI_CALL sim_EnumerateDisplayRefreshRatesFB(XrSession session, uint32_t capacity, uint32_t* count,
+                                                                  float* rates) {
   if (S.rates.empty())
     return S.enumerateRates(session, capacity, count, rates);
   *count = static_cast<uint32_t>(S.rates.size());
@@ -512,8 +512,8 @@ XRAPI_ATTR XrResult XRAPI_CALL sim_CreateApiLayerInstance(const XrInstanceCreate
 } // namespace
 
 SIM_EXPORT XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoaderApiLayerInterface(const XrNegotiateLoaderInfo* loaderInfo,
-                                                                            const char* layerName,
-                                                                            XrNegotiateApiLayerRequest* request) {
+                                                                             const char* layerName,
+                                                                             XrNegotiateApiLayerRequest* request) {
   if (layerName == nullptr || std::strcmp(layerName, kLayerName) != 0 || loaderInfo == nullptr || request == nullptr ||
       loaderInfo->structType != XR_LOADER_INTERFACE_STRUCT_LOADER_INFO ||
       request->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_REQUEST)

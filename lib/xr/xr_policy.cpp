@@ -74,7 +74,8 @@ Profile classify_profile(std::string_view path) noexcept {
   if (path.empty())
     return Profile::None;
   if (path == "/interaction_profiles/oculus/touch_controller" ||
-      path == "/interaction_profiles/meta/touch_controller_plus" || path == "/interaction_profiles/meta/touch_pro_controller")
+      path == "/interaction_profiles/meta/touch_controller_plus" ||
+      path == "/interaction_profiles/meta/touch_pro_controller")
     return Profile::Touch;
   if (path == "/interaction_profiles/valve/frame_controller_valve")
     return Profile::Frame;
@@ -85,7 +86,9 @@ Profile classify_profile(std::string_view path) noexcept {
   return Profile::OtherController;
 }
 
-bool joints_are_hand(Profile current) noexcept { return current != Profile::Frame && current != Profile::OtherController; }
+bool joints_are_hand(Profile current) noexcept {
+  return current != Profile::Frame && current != Profile::OtherController;
+}
 
 std::vector<Binding> touch_bindings(bool haptics) {
   std::vector<Binding> b{
@@ -138,7 +141,8 @@ std::vector<std::vector<Binding>> frame_binding_variants() {
     if (shoulder != nullptr) {
       const bool bumper = std::strcmp(shoulder, "bumper") == 0;
       b.push_back({Act::GripL, bumper ? "/user/hand/left/input/bumper/click" : "/user/hand/left/input/shoulder/click"});
-      b.push_back({Act::GripR, bumper ? "/user/hand/right/input/bumper/click" : "/user/hand/right/input/shoulder/click"});
+      b.push_back(
+          {Act::GripR, bumper ? "/user/hand/right/input/bumper/click" : "/user/hand/right/input/shoulder/click"});
     }
     if (dpad) {
       b.push_back({Act::DUp, "/user/hand/left/input/dpad_up/click"});
@@ -155,8 +159,8 @@ std::vector<std::vector<Binding>> frame_binding_variants() {
   // Valve's documentation names the shoulder buttons bumper; SteamVR 2.17.10
   // calls them shoulder and still accepts bumper.
   return {
-      variant("bumper", true, true),   variant("shoulder", true, true), variant("bumper", false, true),
-      variant("shoulder", false, true), variant(nullptr, false, true),  variant("bumper", true, false),
+      variant("bumper", true, true),    variant("shoulder", true, true), variant("bumper", false, true),
+      variant("shoulder", false, true), variant(nullptr, false, true),   variant("bumper", true, false),
       variant("shoulder", true, false), variant(nullptr, false, false),
   };
 }
