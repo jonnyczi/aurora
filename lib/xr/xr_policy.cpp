@@ -120,7 +120,7 @@ std::vector<Binding> touch_bindings(bool haptics) {
 }
 
 std::vector<std::vector<Binding>> frame_binding_variants() {
-  const auto variant = [](const char* shoulder, bool dpad, bool haptics) {
+  const auto variant = [](const char* shoulder, bool dpad, bool haptics, bool view = false) {
     std::vector<Binding> b{
         {Act::Stick, "/user/hand/left/input/thumbstick"},     {Act::CStick, "/user/hand/right/input/thumbstick"},
         {Act::A, "/user/hand/right/input/a/click"},           {Act::B, "/user/hand/right/input/b/click"},
@@ -142,6 +142,8 @@ std::vector<std::vector<Binding>> frame_binding_variants() {
       b.push_back({Act::DLeft, "/user/hand/left/input/dpad_left/click"});
       b.push_back({Act::DRight, "/user/hand/left/input/dpad_right/click"});
     }
+    if (view)
+      b.push_back({Act::View, "/user/hand/left/input/view/click"});
     if (haptics) {
       b.push_back({Act::RumbleL, "/user/hand/left/output/haptic"});
       b.push_back({Act::RumbleR, "/user/hand/right/output/haptic"});
@@ -151,9 +153,10 @@ std::vector<std::vector<Binding>> frame_binding_variants() {
   // Valve's documentation names the shoulder buttons bumper; SteamVR 2.17.10
   // calls them shoulder and still accepts bumper.
   return {
-      variant("bumper", true, true),    variant("shoulder", true, true), variant("bumper", false, true),
-      variant("shoulder", false, true), variant(nullptr, false, true),   variant("bumper", true, false),
-      variant("shoulder", true, false), variant(nullptr, false, false),
+      variant("bumper", true, true, true), variant("shoulder", true, true, true), variant("bumper", true, true),
+      variant("shoulder", true, true),     variant("bumper", false, true),        variant("shoulder", false, true),
+      variant(nullptr, false, true),       variant("bumper", true, false),        variant("shoulder", true, false),
+      variant(nullptr, false, false),
   };
 }
 

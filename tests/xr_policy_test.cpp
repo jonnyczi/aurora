@@ -182,6 +182,10 @@ TEST(XrPolicyInput, FrameBindings) {
         std::pair{Act::DLeft, "/user/hand/left/input/dpad_left/click"},
         std::pair{Act::DRight, "/user/hand/left/input/dpad_right/click"}})
     EXPECT_TRUE(has(best, act, path)) << path;
+  // The left View button switches room and skybox; without it next.
+  EXPECT_TRUE(has(best, Act::View, "/user/hand/left/input/view/click"));
+  EXPECT_EQ(count(variants[2], Act::View), 0);
+  EXPECT_TRUE(has(variants[2], Act::DUp, "/user/hand/left/input/dpad_up/click"));
   EXPECT_EQ(count(best, Act::RumbleL), 1);
   // The rename: shoulder after bumper.
   EXPECT_TRUE(has(variants[1], Act::Z, "/user/hand/left/input/shoulder/click"));
