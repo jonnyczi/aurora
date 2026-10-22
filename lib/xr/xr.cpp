@@ -11275,13 +11275,18 @@ wgpu::Texture begin_frame(uint32_t width, uint32_t height) noexcept {
     // twice the bins of 2x, and every draw is replayed per bin. Four-CPU
     // Brinstar's eye pass at GPU level 2: 10.7 ms at 4x, 9.4 at 2x, 7.6 at 1x
     // (2x needs the Dawn fork's sample count 2, 051c687).
+    // So on any tile-based GPU (Adreno, Mali, PowerVR), Android or not: the
+    // Steam Frame's Adreno runs Linux.
     {
+      VkPhysicalDeviceProperties pp{};
+      vkGetPhysicalDeviceProperties(B.phys, &pp);
+      const bool tiler = pp.vendorID == 0x5143 || pp.vendorID == 0x13B5 || pp.vendorID == 0x1010;
 #ifdef __ANDROID__
-      constexpr float kDefaultSamples = 2.f;
+      constexpr bool android = true;
 #else
-      constexpr float kDefaultSamples = 1.f;
+      constexpr bool android = false;
 #endif
-      const int n = static_cast<int>(env_float("AURORA_XR_MSAA", kDefaultSamples));
+      const int n = static_cast<int>(env_float("AURORA_XR_MSAA", android || tiler ? 2.f : 1.f));
       g_xrSamples = g_multiview && (n == 2 || n == 4) ? static_cast<uint32_t>(n) : 1u;
     }
     Log.info("3D eyes: {}, {}x MSAA", g_multiview ? "multiview, both in one pass" : "side by side, one pass each",
