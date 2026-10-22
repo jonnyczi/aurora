@@ -17,35 +17,53 @@
 //     queue (xrBeginFrame, xrEndFrame, swapchain acquire and release).
 // Off (the queue isn't shared), the guard does nothing.
 //
-// Lock order: this lock, then Dawn's device lock, never the other way. Dawn
-// calls its callbacks with its own lock released, but they can run with this
-// one held (inside a wrapped event processing call), so a callback must not
-// wait for another thread that is waiting for this lock.
+// Two locks: Dawn's side holds one through each wrapped call, so a submit can
+// translate its command buffers with Dawn's flush held (HoldQueueFlush),
+// touching no queue, while nothing else reaches Dawn; the queue lock is held
+// only where the queue is used (the flush, the other wrapped calls, the XR
+// thread's). The XR thread waits for the queue, never for a translation.
+//
+// Lock order: Dawn's side, then the queue, then Dawn's device lock, never
+// the other way. Dawn calls its callbacks with its own lock released, but
+// they can run with these held (inside a wrapped event processing call), so
+// a callback must not wait for another thread that is waiting for them.
 
 #include <cstdint>
 
+#include <webgpu/webgpu.h>
+
 namespace aurora::webgpu {
 
-// Sharing on or off; set once, when the device is created, before any
-// thread but the creating one uses it.
-void set_queue_shared(bool shared) noexcept;
+// Sharing on or off, for this device; set once, when the device is created,
+// before any thread but the creating one uses it.
+void set_queue_shared(bool shared, WGPUDevice device) noexcept;
 bool queue_shared() noexcept;
 
 class QueueGuard {
 public:
-  // timed: the wait for the lock is counted (queue_guard_waits), for the
-  // XR thread, whose frames it can make late.
-  explicit QueueGuard(bool timed = false) noexcept;
+  // timed: the wait for the lock is counted (queue_guard_stats), for the
+  // XR thread, whose frames it can make late. site: who holds it, for
+  // queue_guard_stats' longest hold.
+  explicit QueueGuard(bool timed = false, const char* site = "XR thread") noexcept;
   ~QueueGuard();
   QueueGuard(const QueueGuard&) = delete;
   QueueGuard& operator=(const QueueGuard&) = delete;
 
 private:
   bool m_locked = false;
+  const char* m_site = nullptr;
+  int64_t m_since = 0;
 };
 
-// The timed waits since the last call: the longest, in nanoseconds, and how
-// many took over a millisecond. Resets both.
-void queue_guard_waits(int64_t& maxNs, uint32_t& over1ms) noexcept;
+// Since the last call: the XR thread's longest wait for the queue and how
+// many took over a millisecond, and the longest anyone held it, and where
+// (a wrapped Dawn entry point's name, or the XR thread). Resets them.
+struct QueueGuardStats {
+  int64_t waitMaxNs = 0;
+  uint32_t waitsOver1ms = 0;
+  int64_t holdMaxNs = 0;
+  const char* holdMaxSite = "";
+};
+QueueGuardStats queue_guard_stats() noexcept;
 
 } // namespace aurora::webgpu
