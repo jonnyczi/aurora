@@ -163,15 +163,14 @@ TEST(XrPolicyInput, FrameBindings) {
   EXPECT_TRUE(has(best, Act::GrabL, "/user/hand/left/input/squeeze/value"));
   EXPECT_TRUE(has(best, Act::GrabR, "/user/hand/right/input/squeeze/value"));
   // A/B/X/Y and Start on the right controller, the D-pad on the left.
-  for (auto [act, path] : {std::pair{Act::A, "/user/hand/right/input/a/click"},
-                           std::pair{Act::B, "/user/hand/right/input/b/click"},
-                           std::pair{Act::X, "/user/hand/right/input/x/click"},
-                           std::pair{Act::Y, "/user/hand/right/input/y/click"},
-                           std::pair{Act::Start, "/user/hand/right/input/menu/click"},
-                           std::pair{Act::DUp, "/user/hand/left/input/dpad_up/click"},
-                           std::pair{Act::DDown, "/user/hand/left/input/dpad_down/click"},
-                           std::pair{Act::DLeft, "/user/hand/left/input/dpad_left/click"},
-                           std::pair{Act::DRight, "/user/hand/left/input/dpad_right/click"}})
+  for (auto [act, path] :
+       {std::pair{Act::A, "/user/hand/right/input/a/click"}, std::pair{Act::B, "/user/hand/right/input/b/click"},
+        std::pair{Act::X, "/user/hand/right/input/x/click"}, std::pair{Act::Y, "/user/hand/right/input/y/click"},
+        std::pair{Act::Start, "/user/hand/right/input/menu/click"},
+        std::pair{Act::DUp, "/user/hand/left/input/dpad_up/click"},
+        std::pair{Act::DDown, "/user/hand/left/input/dpad_down/click"},
+        std::pair{Act::DLeft, "/user/hand/left/input/dpad_left/click"},
+        std::pair{Act::DRight, "/user/hand/left/input/dpad_right/click"}})
     EXPECT_TRUE(has(best, act, path)) << path;
   EXPECT_EQ(count(best, Act::RumbleL), 1);
   // The rename: shoulder after bumper.

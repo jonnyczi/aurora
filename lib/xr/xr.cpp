@@ -668,7 +668,11 @@ Bridge B;
 // Vulkan and OpenXR calls that may use the queue the runtime has (Dawn's,
 // when it is shared: lib/webgpu/queue_guard.hpp). The XR thread's waits for
 // the lock are counted.
-#define ON_QUEUE(x) [&] { const webgpu::QueueGuard queueGuard_{true, #x}; return (x); }()
+#define ON_QUEUE(x)                                                                                                    \
+  [&] {                                                                                                                \
+    const webgpu::QueueGuard queueGuard_{true, #x};                                                                    \
+    return (x);                                                                                                        \
+  }()
 
 bool env_flag(const char* name, bool def) {
   const char* v = std::getenv(name);
@@ -1150,7 +1154,7 @@ VkImageCreateInfo swapchain_image_info(const Stream& st) {
 // were alive when the runtime first refused one (XR_ERROR_LIMIT_REACHED).
 // The screen, the 3D view, the HUD and the lasers are always tried.
 int g_liveSwapchains = 0, g_peakSwapchains = 0;
-int g_swapchainBudget = -1; // -1: not read yet; 0: none known
+int g_swapchainBudget = -1;      // -1: not read yet; 0: none known
 bool g_swapchainLimited = false; // the last refusal was the budget's (worth trying again later)
 
 XrResult new_swapchain(const XrSwapchainCreateInfo& ci, XrSwapchain& out, bool optional) {
@@ -1547,8 +1551,8 @@ void update_hand_profiles() {
   for (int h = 0; h < 2; ++h) {
     XrInteractionProfileState st{XR_TYPE_INTERACTION_PROFILE_STATE};
     std::string name;
-    if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(B.session, path(h == 0 ? "/user/hand/left" : "/user/hand/right"),
-                                                    &st)) &&
+    if (XR_SUCCEEDED(
+            xrGetCurrentInteractionProfile(B.session, path(h == 0 ? "/user/hand/left" : "/user/hand/right"), &st)) &&
         st.interactionProfile != XR_NULL_PATH) {
       char buf[XR_MAX_PATH_LENGTH];
       uint32_t n = 0;
@@ -1561,10 +1565,10 @@ void update_hand_profiles() {
     B.handProfile[h] = kind;
   }
   const auto either = [](policy::Profile p) { return B.handProfile[0] == p || B.handProfile[1] == p; };
-  g_controllers = either(policy::Profile::Frame) ? AURORA_XR_CONTROLLERS_FRAME
-                  : either(policy::Profile::Touch) ? AURORA_XR_CONTROLLERS_TOUCH
+  g_controllers = either(policy::Profile::Frame)             ? AURORA_XR_CONTROLLERS_FRAME
+                  : either(policy::Profile::Touch)           ? AURORA_XR_CONTROLLERS_TOUCH
                   : either(policy::Profile::OtherController) ? AURORA_XR_CONTROLLERS_OTHER
-                                                              : AURORA_XR_CONTROLLERS_NONE;
+                                                             : AURORA_XR_CONTROLLERS_NONE;
 }
 
 bool create_input() {
@@ -1598,26 +1602,64 @@ bool create_input() {
       using policy::Act;
       XrAction a = XR_NULL_HANDLE;
       switch (act) {
-      case Act::Stick: a = B.stickMain; break;
-      case Act::CStick: a = B.stickC; break;
-      case Act::A: a = B.btnA; break;
-      case Act::B: a = B.btnB; break;
-      case Act::X: a = B.btnX; break;
-      case Act::Y: a = B.btnY; break;
-      case Act::Z: a = B.btnZ; break;
-      case Act::Start: a = B.btnStart; break;
-      case Act::L: a = B.trigL; break;
-      case Act::R: a = B.trigR; break;
-      case Act::AimL: a = B.aim[0]; break;
-      case Act::AimR: a = B.aim[1]; break;
-      case Act::GrabL: a = B.grab[0]; break;
-      case Act::GrabR: a = B.grab[1]; break;
-      case Act::DUp: a = B.dpad[0]; break;
-      case Act::DDown: a = B.dpad[1]; break;
-      case Act::DLeft: a = B.dpad[2]; break;
-      case Act::DRight: a = B.dpad[3]; break;
+      case Act::Stick:
+        a = B.stickMain;
+        break;
+      case Act::CStick:
+        a = B.stickC;
+        break;
+      case Act::A:
+        a = B.btnA;
+        break;
+      case Act::B:
+        a = B.btnB;
+        break;
+      case Act::X:
+        a = B.btnX;
+        break;
+      case Act::Y:
+        a = B.btnY;
+        break;
+      case Act::Z:
+        a = B.btnZ;
+        break;
+      case Act::Start:
+        a = B.btnStart;
+        break;
+      case Act::L:
+        a = B.trigL;
+        break;
+      case Act::R:
+        a = B.trigR;
+        break;
+      case Act::AimL:
+        a = B.aim[0];
+        break;
+      case Act::AimR:
+        a = B.aim[1];
+        break;
+      case Act::GrabL:
+        a = B.grab[0];
+        break;
+      case Act::GrabR:
+        a = B.grab[1];
+        break;
+      case Act::DUp:
+        a = B.dpad[0];
+        break;
+      case Act::DDown:
+        a = B.dpad[1];
+        break;
+      case Act::DLeft:
+        a = B.dpad[2];
+        break;
+      case Act::DRight:
+        a = B.dpad[3];
+        break;
       case Act::RumbleL:
-      case Act::RumbleR: a = B.rumble; break;
+      case Act::RumbleR:
+        a = B.rumble;
+        break;
       }
       out.emplace_back(a, binding);
     }
@@ -1627,7 +1669,8 @@ bool create_input() {
   // The game's rumble on both controllers' haptics. Suggested with the pad's
   // bindings (a later suggestion for a profile replaces the earlier one), and
   // the pad alone again if the runtime turns that down.
-  bool touch = rumble && suggest("/interaction_profiles/oculus/touch_controller", bindings(policy::touch_bindings(true)));
+  bool touch =
+      rumble && suggest("/interaction_profiles/oculus/touch_controller", bindings(policy::touch_bindings(true)));
   bool haptics = touch;
   if (!touch) {
     Log.warn("Touch controller haptics not bound: no rumble");
@@ -2866,18 +2909,19 @@ void update_pacing() {
   // granted, 72 shown).
   const float rate = g_loopPeriodNs > 0 ? static_cast<float>(1e9 / static_cast<double>(g_loopPeriodNs))
                                         : policy::display_rate(reported, g_displayPeriodNs);
-  g_displayHz = rate;
+  const float oldHz = g_displayHz.exchange(rate);
   const int per = policy::per_game_frame(rate);
   const int old = g_displayPerGameFrame.exchange(env_flag("AURORA_XR_LOCKSTEP", true) ? per : 0);
-  if (old != g_displayPerGameFrame)
+  if (old != g_displayPerGameFrame || std::abs(oldHz - rate) > 0.5f)
     Log.info("Display at {:.1f} Hz{}: {}", rate,
              reported > 0.f && std::abs(reported - rate) > 0.5f && g_loopPeriodNs <= 0
                  ? fmt::format(" (the runtime reports {:.0f} Hz; frames come every {:.2f} ms)", reported,
                                g_displayPeriodNs / 1e6)
                  : std::string{},
-             g_displayPerGameFrame ? fmt::format("game paced to every {} display frame(s)", g_displayPerGameFrame.load())
-                                   : std::string{"not a multiple of 60 Hz, game keeps its own timer (a headset "
-                                                 "set to 120 Hz shows each game frame for two display frames)"});
+             g_displayPerGameFrame
+                 ? fmt::format("game paced to every {} display frame(s)", g_displayPerGameFrame.load())
+                 : std::string{"not a multiple of 60 Hz, game keeps its own timer (a headset "
+                               "set to 120 Hz shows each game frame for two display frames)"});
 }
 
 // Publish where the eyes will be when the render worker's next 3D frame is
@@ -8761,9 +8805,10 @@ bool render_xr_frame() {
              g_acquireWaitsOver2[kScreen], pace_summary());
     if (B.sharedQueue) {
       const auto q = webgpu::queue_guard_stats();
-      Log.info("Shared queue: the XR thread waited for it {:.2f} ms at most, {} times over 1 ms; held {:.2f} ms at "
-               "most, by {}",
-               q.waitMaxNs / 1e6, q.waitsOver1ms, q.holdMaxNs / 1e6, q.holdMaxSite);
+      Log.info(
+          "Shared queue: the XR thread waited for it {:.2f} ms at most, {} times over 1 ms; held {:.2f} ms at "
+          "most, by {}",
+          q.waitMaxNs / 1e6, q.waitsOver1ms, q.holdMaxNs / 1e6, q.holdMaxSite);
     }
     g_acquireWaitMaxNs = {};
     g_acquireWaitsOver2 = {};
@@ -8883,9 +8928,9 @@ bool setup() {
       return false;
   if (g_streams[kStereo].staged)
     Log.info("3D images staged: {} of our own per stream, copied into the swapchains", g_streams[kStereo].ring.size());
-  if (const auto& mv = g_streams[kMotion]; B.appSw && mv.width > 0 &&
-                                           !create_static_swapchain(B.zeroMotionSwapchain, mv.width, mv.height, {},
-                                                                    mv.swapFormat, mv.layers, true))
+  if (const auto& mv = g_streams[kMotion];
+      B.appSw && mv.width > 0 &&
+      !create_static_swapchain(B.zeroMotionSwapchain, mv.width, mv.height, {}, mv.swapFormat, mv.layers, true))
     Log.warn("SpaceWarp: no zero motion vectors; images submitted again go without SpaceWarp info");
   // The room by alpha blending: a clear image for the projection layer every
   // frame starts with (create_static_swapchain clears it to zero).
@@ -8951,8 +8996,8 @@ void teardown() {
       B.destroyHandTracker(ht);
     ht = XR_NULL_HANDLE;
   }
-  for (XrSwapchain* sc : {&B.beamSwapchain, &B.dotSwapchain, &B.barSwapchain, &B.backSwapchain,
-                          &B.zeroMotionSwapchain, &B.shadowSwapchain, &B.roomSwapchain}) {
+  for (XrSwapchain* sc : {&B.beamSwapchain, &B.dotSwapchain, &B.barSwapchain, &B.backSwapchain, &B.zeroMotionSwapchain,
+                          &B.shadowSwapchain, &B.roomSwapchain}) {
     if (*sc)
       free_swapchain(*sc);
     *sc = XR_NULL_HANDLE;

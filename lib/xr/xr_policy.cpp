@@ -74,7 +74,8 @@ Profile classify_profile(std::string_view path) noexcept {
   if (path.empty())
     return Profile::None;
   if (path == "/interaction_profiles/oculus/touch_controller" ||
-      path == "/interaction_profiles/meta/touch_controller_plus" || path == "/interaction_profiles/meta/touch_pro_controller")
+      path == "/interaction_profiles/meta/touch_controller_plus" ||
+      path == "/interaction_profiles/meta/touch_pro_controller")
     return Profile::Touch;
   if (path == "/interaction_profiles/valve/frame_controller_valve")
     return Profile::Frame;
@@ -85,7 +86,9 @@ Profile classify_profile(std::string_view path) noexcept {
   return Profile::OtherController;
 }
 
-bool joints_are_hand(Profile current) noexcept { return current != Profile::Frame && current != Profile::OtherController; }
+bool joints_are_hand(Profile current) noexcept {
+  return current != Profile::Frame && current != Profile::OtherController;
+}
 
 std::vector<Binding> touch_bindings(bool haptics) {
   std::vector<Binding> b{
@@ -115,18 +118,12 @@ std::vector<Binding> touch_bindings(bool haptics) {
 std::vector<std::vector<Binding>> frame_binding_variants() {
   const auto variant = [](const char* shoulder, bool dpad, bool haptics) {
     std::vector<Binding> b{
-        {Act::Stick, "/user/hand/left/input/thumbstick"},
-        {Act::CStick, "/user/hand/right/input/thumbstick"},
-        {Act::A, "/user/hand/right/input/a/click"},
-        {Act::B, "/user/hand/right/input/b/click"},
-        {Act::X, "/user/hand/right/input/x/click"},
-        {Act::Y, "/user/hand/right/input/y/click"},
-        {Act::Start, "/user/hand/right/input/menu/click"},
-        {Act::L, "/user/hand/left/input/trigger/value"},
-        {Act::R, "/user/hand/right/input/trigger/value"},
-        {Act::AimL, "/user/hand/left/input/aim/pose"},
-        {Act::AimR, "/user/hand/right/input/aim/pose"},
-        {Act::GrabL, "/user/hand/left/input/squeeze/value"},
+        {Act::Stick, "/user/hand/left/input/thumbstick"},     {Act::CStick, "/user/hand/right/input/thumbstick"},
+        {Act::A, "/user/hand/right/input/a/click"},           {Act::B, "/user/hand/right/input/b/click"},
+        {Act::X, "/user/hand/right/input/x/click"},           {Act::Y, "/user/hand/right/input/y/click"},
+        {Act::Start, "/user/hand/right/input/menu/click"},    {Act::L, "/user/hand/left/input/trigger/value"},
+        {Act::R, "/user/hand/right/input/trigger/value"},     {Act::AimL, "/user/hand/left/input/aim/pose"},
+        {Act::AimR, "/user/hand/right/input/aim/pose"},       {Act::GrabL, "/user/hand/left/input/squeeze/value"},
         {Act::GrabR, "/user/hand/right/input/squeeze/value"},
     };
     // Both hands' shoulder buttons press Z (the GameCube's is a shoulder button).
@@ -150,8 +147,8 @@ std::vector<std::vector<Binding>> frame_binding_variants() {
   // Valve's documentation names the shoulder buttons bumper; SteamVR 2.17.10
   // calls them shoulder and still accepts bumper.
   return {
-      variant("bumper", true, true),   variant("shoulder", true, true), variant("bumper", false, true),
-      variant("shoulder", false, true), variant(nullptr, false, true),  variant("bumper", true, false),
+      variant("bumper", true, true),    variant("shoulder", true, true), variant("bumper", false, true),
+      variant("shoulder", false, true), variant(nullptr, false, true),   variant("bumper", true, false),
       variant("shoulder", true, false), variant(nullptr, false, false),
   };
 }

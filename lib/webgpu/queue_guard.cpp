@@ -49,8 +49,7 @@ QueueGuard::QueueGuard(bool timed, const char* site) noexcept : m_site(site) {
     g_queueMutex.lock();
     const int64_t ns = now_ns() - start;
     int64_t prev = g_waitMaxNs.load(std::memory_order_relaxed);
-    while (ns > prev && !g_waitMaxNs.compare_exchange_weak(prev, ns, std::memory_order_relaxed)) {
-    }
+    while (ns > prev && !g_waitMaxNs.compare_exchange_weak(prev, ns, std::memory_order_relaxed)) {}
     if (ns > 1000000)
       g_waitsOver1ms.fetch_add(1, std::memory_order_relaxed);
   }
@@ -146,7 +145,8 @@ AURORA_WRAP_VOID(wgpuSurfaceGetCurrentTexture, (WGPUSurface s, WGPUSurfaceTextur
 AURORA_WRAP_VOID(wgpuSurfaceConfigure, (WGPUSurface s, WGPUSurfaceConfiguration const* c), (s, c))
 AURORA_WRAP_VOID(wgpuSurfaceUnconfigure, (WGPUSurface s), (s))
 AURORA_WRAP(WGPUStatus, wgpuSharedTextureMemoryBeginAccess,
-            (WGPUSharedTextureMemory m, WGPUTexture t, WGPUSharedTextureMemoryBeginAccessDescriptor const* d), (m, t, d))
+            (WGPUSharedTextureMemory m, WGPUTexture t, WGPUSharedTextureMemoryBeginAccessDescriptor const* d),
+            (m, t, d))
 AURORA_WRAP(WGPUStatus, wgpuSharedTextureMemoryEndAccess,
             (WGPUSharedTextureMemory m, WGPUTexture t, WGPUSharedTextureMemoryEndAccessState* d), (m, t, d))
 

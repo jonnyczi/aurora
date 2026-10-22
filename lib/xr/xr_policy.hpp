@@ -80,7 +80,26 @@ bool joints_are_hand(Profile current) noexcept;
 
 // The pad's actions (lib/xr/xr.cpp maps them to XrActions).
 enum class Act {
-  Stick, CStick, A, B, X, Y, Z, Start, L, R, AimL, AimR, GrabL, GrabR, DUp, DDown, DLeft, DRight, RumbleL, RumbleR,
+  Stick,
+  CStick,
+  A,
+  B,
+  X,
+  Y,
+  Z,
+  Start,
+  L,
+  R,
+  AimL,
+  AimR,
+  GrabL,
+  GrabR,
+  DUp,
+  DDown,
+  DLeft,
+  DRight,
+  RumbleL,
+  RumbleR,
 };
 struct Binding {
   Act act;
