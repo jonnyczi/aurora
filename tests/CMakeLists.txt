@@ -226,3 +226,8 @@ add_executable(xr_policy_tests
 target_include_directories(xr_policy_tests PRIVATE ../lib)
 target_link_libraries(xr_policy_tests PRIVATE gtest gtest_main)
 gtest_discover_tests(xr_policy_tests)
+
+# A Steam Frame personality for a desktop OpenXR runtime (xr_sim_layer/).
+if (AURORA_ENABLE_OPENXR AND NOT ANDROID AND TARGET OpenXR::headers)
+  add_subdirectory(xr_sim_layer)
+endif ()
