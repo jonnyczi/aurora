@@ -2649,47 +2649,50 @@ void request_refresh_rate() {
   std::string list;
   for (float r : rates)
     list += fmt::format("{}{:.0f}", list.empty() ? "" : ", ", r);
-  const auto offered = [&](float want) {
-    return std::any_of(rates.begin(), rates.end(), [&](float r) { return std::abs(r - want) < 0.5f; });
-  };
-  float pick = 0.f;
-  if (const float wanted = env_float("AURORA_XR_REFRESH", 0.f); wanted > 0.f && offered(wanted))
-    pick = wanted;
-  else if (offered(60.f))
-    pick = 60.f;
-  else if (offered(120.f))
-    pick = 120.f;
+  // AURORA_XR_REFRESH if offered, else 60, else 120; nothing where the
+  // runtime lists a single rate (the Steam Frame: the one the player chose).
+  const float pick = policy::pick_refresh(rates, env_float("AURORA_XR_REFRESH", 0.f));
   if (pick > 0.f && XR_SUCCEEDED(B.requestRefreshRate(B.session, pick)))
     Log.info("Display refresh rates offered: {}; requested {:.0f} Hz", list, pick);
   else
-    Log.info("Display refresh rates offered: {}; keeping the default", list);
+    Log.info("Display refresh rates offered: {}; keeping the {}", list, rates.size() == 1 ? "headset's" : "default");
 }
 
 // Recompute how many display frames each game frame gets from the current
-// display rate (on session start and on XR_FB_display_refresh_rate changes).
-// The XR loop's period while Application SpaceWarp runs it at half the
-// display rate (xrWaitFrame's predictedDisplayPeriod; 0: the display's).
+// display rate (on session start, on XR_FB_display_refresh_rate changes and
+// when xrWaitFrame's period changes). The XR loop's period while Application
+// SpaceWarp runs it at half the display rate (xrWaitFrame's
+// predictedDisplayPeriod; 0: the display's).
 int64_t g_loopPeriodNs = 0;
+// xrWaitFrame's predictedDisplayPeriod without SpaceWarp: the display's
+// period, whatever the runtime reports (0: no frame yet).
+int64_t g_displayPeriodNs = 0;
 
 void update_pacing() {
-  float rate = 0.f;
+  float reported = 0.f;
   if (B.getRefreshRate)
-    B.getRefreshRate(B.session, &rate);
-  g_refreshHz = rate;
+    B.getRefreshRate(B.session, &reported);
+  g_refreshHz = reported;
   // SpaceWarp: the loop runs at what xrWaitFrame paces it to, and the game
-  // ticks on that.
-  if (g_loopPeriodNs > 0)
-    rate = static_cast<float>(1e9 / static_cast<double>(g_loopPeriodNs));
-  if (rate <= 0.f && !B.getRefreshRate)
-    rate = 60.f; // no extension (e.g. some runtimes): assume a 60 Hz display
+  // ticks on that. Otherwise the reported rate while the frames come at it,
+  // else their period: a runtime without XR_FB_display_refresh_rate (a 90 Hz
+  // display used to be taken for 60 and stepped the game 90 times a second),
+  // or one granting a rate it doesn't run at (SteamVR on the Steam Frame, 90
+  // granted, 72 shown).
+  const float rate = g_loopPeriodNs > 0 ? static_cast<float>(1e9 / static_cast<double>(g_loopPeriodNs))
+                                        : policy::display_rate(reported, g_displayPeriodNs);
   g_displayHz = rate;
-  const float ratio = rate / 60.f;
-  const int per = std::abs(ratio - std::round(ratio)) < 0.02f ? static_cast<int>(std::round(ratio)) : 0;
+  const int per = policy::per_game_frame(rate);
   const int old = g_displayPerGameFrame.exchange(env_flag("AURORA_XR_LOCKSTEP", true) ? per : 0);
   if (old != g_displayPerGameFrame)
-    Log.info("Display at {:.1f} Hz: {}", rate,
+    Log.info("Display at {:.1f} Hz{}: {}", rate,
+             reported > 0.f && std::abs(reported - rate) > 0.5f && g_loopPeriodNs <= 0
+                 ? fmt::format(" (the runtime reports {:.0f} Hz; frames come every {:.2f} ms)", reported,
+                               g_displayPeriodNs / 1e6)
+                 : std::string{},
              g_displayPerGameFrame ? fmt::format("game paced to every {} display frame(s)", g_displayPerGameFrame.load())
-                                   : std::string{"not a multiple of 60 Hz, game keeps its own timer"});
+                                   : std::string{"not a multiple of 60 Hz, game keeps its own timer (a headset "
+                                                 "set to 120 Hz shows each game frame for two display frames)"});
 }
 
 // Publish where the eyes will be when the render worker's next 3D frame is
@@ -8048,6 +8051,12 @@ bool render_xr_frame() {
       Log.info("XR loop period {:.2f} ms: SpaceWarp {}", period / 1e6,
                g_displayHz.load() < 100.f ? "active" : "idle");
     }
+  } else if (fs.predictedDisplayPeriod > 0 &&
+             std::llabs(fs.predictedDisplayPeriod - g_displayPeriodNs) * 10 > std::max<int64_t>(g_displayPeriodNs, 1)) {
+    // The display's period: what pacing goes by where the runtime reports no
+    // rate, or one it doesn't run at.
+    g_displayPeriodNs = fs.predictedDisplayPeriod;
+    update_pacing();
   }
   B.loopWaitNs = monotonic_ns();
   if (B.loopLastWaitNs != 0) {
