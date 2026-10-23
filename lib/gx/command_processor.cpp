@@ -2514,7 +2514,9 @@ void handle_aurora(ByteReader& reader) noexcept {
     } else if (category == 5 || category == 7 || category == 8) { // planes 3-4, 5-6, 7-8
       gfx::xr_set_world_clip_more(category == 5 ? 1 : category - 5, view.data());
     } else if (category == 9) { // aurora_xr_world_still
+#if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
       sXrStill = hasView;
+#endif
     } else {
       const auto cat = category <= 2 ? static_cast<gfx::XrCategory>(category)
                        : category == 6 ? gfx::XrCategory::Hidden // AURORA_XR_HIDDEN
