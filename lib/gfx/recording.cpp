@@ -729,6 +729,15 @@ void increment_merged_draw_count() noexcept {
 
 } // namespace detail
 
+bool restamp_xr_frame_tick(uint64_t displayFrame) noexcept {
+  if (!g_recorder.active() || g_recorder.drawCallCount != 0)
+    return false;
+  auto& frame = g_recorder.frame();
+  frame.xrTickFrame = displayFrame;
+  frame.xrRecordStartNs = std::chrono::steady_clock::now().time_since_epoch().count();
+  return true;
+}
+
 void set_preserve_frame_buffer(bool preserve) noexcept {
   detail::g_preserveFrameBuffer = preserve;
 }

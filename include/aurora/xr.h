@@ -68,6 +68,16 @@ bool aurora_xr_pace(void);
 uint64_t aurora_xr_pace_count(void);
 bool aurora_xr_pace_until(uint64_t count);
 
+/* Netplay: the open frame, begun on tick `count`, waited for the peer's
+ * input before drawing anything. Unless that tick is still the newest and
+ * at most `max_age_ns` old, blocks until the next tick and re-stamps the
+ * frame with it, so it goes out on that tick instead of late on its own
+ * (SpaceWarp drops a frame whose eyes start a loop after its tick; every
+ * frame a slower peer held up went that way). Returns the tick it now
+ * carries, or 0 when nothing changed: no pacing, the frame's tick still
+ * fresh, or the frame has drawn already. */
+uint64_t aurora_xr_pace_restamp(uint64_t count, uint64_t max_age_ns);
+
 /* Whether the frames begun from now on are held ones: the scene drawn again
  * without the game advancing (a netplay wait). They're shown as any frame,
  * but the pacing probe and dynamic resolution leave them out, their timing

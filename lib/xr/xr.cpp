@@ -360,6 +360,7 @@ std::atomic<float> g_headTurnLast{0.f};
 std::mutex g_paceMutex;
 std::condition_variable g_paceCv;
 uint64_t g_paceTick = 0;
+int64_t g_paceTickNs = 0; // monotonic_ns() when g_paceTick last moved (aurora_xr_pace_restamp)
 std::atomic<int> g_displayPerGameFrame{0};
 std::atomic<float> g_displayHz{0.f}; // the display's refresh rate (0: unknown)
 std::atomic<float> g_refreshHz{0.f}; // the display's own, also with SpaceWarp's loop at half of it
@@ -9463,6 +9464,7 @@ bool render_xr_frame() {
     {
       std::lock_guard lock{g_paceMutex};
       ++g_paceTick;
+      g_paceTickNs = monotonic_ns();
       g_lastTickFrame = B.displayFrame;
 #ifdef __ANDROID__
       trace_counter("XR tick", static_cast<int64_t>(B.displayFrame & 1)); // lines traces up with ticks
@@ -13356,6 +13358,29 @@ extern "C" uint64_t aurora_xr_pace_count(void) {
   }
   std::lock_guard lock{g_paceMutex};
   return g_paceTick;
+}
+
+extern "C" uint64_t aurora_xr_pace_restamp(uint64_t count, uint64_t max_age_ns) {
+  using namespace aurora::xr;
+  std::unique_lock lock{g_paceMutex};
+  if (g_displayPerGameFrame <= 0 || !g_sessionRunning || g_paceTick == 0)
+    return 0;
+  // The newest tick if it's young enough to make its slot, else the next.
+  const bool young = monotonic_ns() - g_paceTickNs <= static_cast<int64_t>(max_age_ns);
+  const uint64_t target = young ? g_paceTick : g_paceTick + 1;
+  if (target <= count)
+    return 0; // still the frame's own tick, early enough
+  const bool due = g_paceCv.wait_for(lock, std::chrono::milliseconds(100), [&] {
+    return g_paceTick >= target || g_displayPerGameFrame <= 0 || !g_sessionRunning;
+  }) && g_paceTick >= target && g_displayPerGameFrame > 0 && g_sessionRunning;
+  const uint64_t frame = g_lastTickFrame.load();
+  const uint64_t now = g_paceTick;
+  lock.unlock();
+  if (!due || !aurora::gfx::restamp_xr_frame_tick(frame))
+    return 0;
+  pace_wake(frame);
+  aurora::gfx::set_xr_game_frame_tick(frame);
+  return now;
 }
 
 extern "C" bool aurora_xr_pace_until(uint64_t count) {

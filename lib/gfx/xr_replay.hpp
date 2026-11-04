@@ -107,6 +107,10 @@ void set_xr_first_pass_timing(XrFirstPassTiming fn) noexcept;
 // the frames recorded from now on carry (FramePacket::xrTickFrame).
 void set_xr_game_frame_tick(uint64_t displayFrame) noexcept;
 uint64_t xr_game_frame_tick() noexcept;
+// Game thread: the open frame carries tick `displayFrame` instead, its
+// recording started now (aurora_xr_pace_restamp). False, and nothing
+// changed, once it has drawn: the early eyes may be on their way.
+bool restamp_xr_frame_tick(uint64_t displayFrame) noexcept;
 // Game thread: whether the frames begun from now on are held ones
 // (FramePacket::xrHeld; aurora_xr_set_held).
 void set_xr_held(bool held) noexcept;
