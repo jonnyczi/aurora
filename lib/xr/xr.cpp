@@ -1745,7 +1745,7 @@ bool density_build(const std::vector<std::pair<uint32_t, uint32_t>>& sizes, cons
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
   si.pCommandBuffers = &up.cmd;
-  if (vkQueueSubmit(B.queue, 1, &si, up.fence) != VK_SUCCESS)
+  if (ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, up.fence)) != VK_SUCCESS)
     return fail();
   std::lock_guard lock{fd.mutex};
   for (const auto& p : parts) {
@@ -8214,7 +8214,7 @@ void room_depth_frame(XrTime displayTime) {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &d.cmd;
-    VK_TRY_VOID(vkQueueSubmit(B.queue, 1, &si, d.fence));
+    VK_TRY_VOID(ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, d.fence)));
     d.copied = im;
     d.copiedNs = now;
     d.pending = true;
